@@ -12,7 +12,7 @@ repositories {
 
 dependencies {
     implementation("net.portswigger.burp.extensions:montoya-api:2025.3")
-    implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.17.2")
+    implementation("com.fasterxml.jackson.core:jackson-databind:2.17.2")
 }
 
 java {

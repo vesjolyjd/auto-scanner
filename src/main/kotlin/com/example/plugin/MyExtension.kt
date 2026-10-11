@@ -5,124 +5,104 @@ import burp.api.montoya.MontoyaApi
 import burp.api.montoya.http.handler.*
 import burp.api.montoya.http.message.requests.HttpRequest
 import burp.api.montoya.http.message.responses.HttpResponse
-
-// Импорты для безопасной работы с JSON и асинхронности
 import com.fasterxml.jackson.databind.node.ObjectNode
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import com.fasterxml.jackson.databind.ObjectMapper
 import java.util.concurrent.CopyOnWriteArrayList
-import kotlin.concurrent.thread // Асинхронные фоновые потоки
+import kotlin.concurrent.thread
 import java.io.File
 
-/**
- * Расширенная модель данных.
- * В отличие от базовой версии, теперь извлекаем и храним параметры из Path, Query и JSON Body
- * для проведения глубокой мутации запроса, а не только подмены Cookie.
- */
-data class TrackedRequest(
-    val url: String,
-    val method: String,
-    val originalRequest: HttpRequest,
-    val pathParams: List<String> = emptyList(),
-    val queryParams: Map<String, String> = emptyMap(),
-    val jsonBodyFields: Map<String, Any?> = emptyMap()
-)
-
 class MyExtension : BurpExtension {
-
+    // Потокобезопасный список для хранения уникальных перехваченных запросов
     private val trackedRequests = CopyOnWriteArrayList<TrackedRequest>()
+    private lateinit var dashboard: AutoScannerDashboardPanel
 
     override fun initialize(api: MontoyaApi) {
-        api.extension().setName("NIRS AutoScanner Pro")
+        // Инициализация имени плагина и приветственных логов
+        api.extension().setName("Burp AutoScanner Pro")
         api.logging().logToOutput("========================================")
-        api.logging().logToOutput("[+] NIRS AutoScanner Pro загружен!")
-        api.logging().logToOutput("[+] Режим: Async + Safe JSON Mutation + Nuclei Orchestration")
+        api.logging().logToOutput("[+] Burp AutoScanner Pro загружен!")
+        api.logging().logToOutput("[+] Режим: Async + Safe JSON Mutation + Nuclei Orchestration + UI Dashboard")
         api.logging().logToOutput("========================================")
 
+        // Регистрация кастомной вкладки графического интерфейса
+        dashboard = AutoScannerDashboardPanel(api)
+        api.userInterface().registerSuiteTab("AutoScanner Dashboard", dashboard)
+
+        // Регистрация обработчика HTTP-трафика
         api.http().registerHttpHandler(object : HttpHandler {
             override fun handleHttpRequestToBeSent(requestToBeSent: HttpRequestToBeSent): RequestToBeSentAction {
+                // Фильтр 1: Обрабатываем только трафик из браузера (Proxy), игнорируя внутренние запросы Burp
                 if (requestToBeSent.toolSource().isFromTool(burp.api.montoya.core.ToolType.PROXY)) {
                     val cookieHeader = requestToBeSent.headerValue("Cookie")
                     val url = requestToBeSent.url()
 
                     if (cookieHeader != null) {
-                        val isAuthRequest = cookieHeader.contains("token", ignoreCase = true) ||
-                                cookieHeader.contains("session", ignoreCase = true)
+                        // Фильтр 2: Проверка наличия маркеров аутентификации
+                        val isAuthRequest = cookieHeader.contains("token", ignoreCase = true) || cookieHeader.contains("session", ignoreCase = true)
 
-                        val isTargetApi = url.contains("/api/") || url.contains("/rest/") ||
-                                url.contains("/profile") || url.contains("/basket") ||
-                                url.contains("/ftp/") || url.contains("/admin")
+                        // Фильтр 3: Allowlist (белый список) целевых API-эндпоинтов
+                        val isTargetApi = url.contains("/api/") || url.contains("/rest/") || url.contains("/profile") || url.contains("/basket") || url.contains("/ftp/") || url.contains("/admin")
 
-                        if (isAuthRequest && isTargetApi) {
-                            // Извлечение параметров для глубокого анализа
-                            val pathParams = extractPathParams(url)
-                            val queryParams = extractQueryParams(url)
-                            val jsonBodyFields = extractJsonBodyFields(requestToBeSent.bodyToString())
+                        // Фильтр 4: Игнорирование артефактов фронтенда (NaN, undefined)
+                        if (isAuthRequest && isTargetApi && !url.contains("/NaN") && !url.contains("/undefined")) {
 
+                            // Парсинг и извлечение потенциальных векторов для мутации
                             val tracked = TrackedRequest(
                                 url = url,
                                 method = requestToBeSent.method(),
                                 originalRequest = requestToBeSent,
-                                pathParams = pathParams,
-                                queryParams = queryParams,
-                                jsonBodyFields = jsonBodyFields
+                                pathParams = extractPathParams(url),
+                                queryParams = extractQueryParams(url),
+                                jsonBodyFields = extractJsonBodyFields(requestToBeSent.bodyToString())
                             )
 
-                            val isDuplicate = trackedRequests.any { it.url == tracked.url && it.method == tracked.method }
-
-                            if (!isDuplicate) {
+                            // Проверка на дубликаты, чтобы не анализировать один и тот же запрос дважды
+                            if (trackedRequests.none { it.url == tracked.url && it.method == tracked.method }) {
                                 trackedRequests.add(tracked)
-                                api.logging().logToOutput("[+] Целевой запрос сохранен: ${tracked.method} ${tracked.url}")
+                                api.logging().logToOutput("[INFO] Целевой запрос сохранен: ${tracked.method} ${tracked.url}")
 
-                                // Асинхронный запуск.
-                                // Предотвращает блокировку основного потока Burp и браузера при генерации десятков мутаций.
-                                thread(start = true, isDaemon = true) {
-                                    testIdorAdvanced(api, tracked)
-                                }
+                                // Асинхронный запуск анализа в фоновом потоке (Daemon), чтобы не блокировать UI Burp
+                                thread(start = true, isDaemon = true) { testIdorAdvanced(api, tracked) }
                             }
                         }
                     }
                 }
+                // Пропускаем запрос дальше без изменений
                 return RequestToBeSentAction.continueWith(requestToBeSent)
             }
 
-            override fun handleHttpResponseReceived(responseReceived: HttpResponseReceived): ResponseReceivedAction {
-                return ResponseReceivedAction.continueWith(responseReceived)
-            }
+            override fun handleHttpResponseReceived(responseReceived: HttpResponseReceived): ResponseReceivedAction =
+                ResponseReceivedAction.continueWith(responseReceived)
         })
     }
 
-    // ============================================================================
-    // ПАРСЕРЫ ПАРАМЕТРОВ ДЛЯ ГЛУБОКОЙ МУТАЦИИ
-    // ============================================================================
+    // =========================================================================
+    // БЛОК ПАРСИНГА: Извлечение параметров из запроса для последующей мутации
+    // =========================================================================
 
-    private fun extractPathParams(url: String): List<String> {
-        val pathOnly = url.substringBefore("?")
-        val regex = Regex("/(\\d+)(?=/|$)")
-        return regex.findAll(pathOnly).map { it.value }.toList()
-    }
+    // Извлекает числовые значения из пути URL (например, "/users/5" -> ["/5"])
+    private fun extractPathParams(url: String): List<String> =
+        Regex("/(\\d+)(?=/|$)").findAll(url.substringBefore("?")).map { it.value }.toList()
 
+    // Парсит строку запроса (Query String) в Map ключ-значение
     private fun extractQueryParams(url: String): Map<String, String> {
         val queryPart = url.substringAfter("?", "")
-        if (queryPart.isEmpty()) return emptyMap()
-        return queryPart.split("&")
-            .map { it.split("=", limit = 2) } // limit=2 защищает от значений, содержащих символ '='
-            .filter { it.size == 2 }
-            .associate { it[0] to it[1] }
+        return if (queryPart.isEmpty()) emptyMap()
+        else queryPart.split("&").map { it.split("=", limit = 2) }.filter { it.size == 2 }.associate { it[0] to it[1] }
     }
 
+    // Анализирует JSON-тело и извлекает поля, которые с высокой вероятностью являются идентификаторами
     private fun extractJsonBodyFields(body: String): Map<String, Any?> {
         if (body.isBlank()) return emptyMap()
-        try {
-            val mapper = jacksonObjectMapper()
-            val json = mapper.readTree(body)
+        return try {
+            val json = ObjectMapper().readTree(body)
             val fields = mutableMapOf<String, Any?>()
-
             json.fields().forEach { (key, value) ->
-                // Эвристика: ищем поля, которые с высокой вероятностью являются идентификаторами
+                // Эвристика: ищем ключевые слова, характерные для ID-полей
                 if (key.contains("id", ignoreCase = true) || key.contains("user", ignoreCase = true) ||
                     key.contains("account", ignoreCase = true) || key.contains("order", ignoreCase = true) ||
-                    key.contains("basket", ignoreCase = true) || key.contains("profile", ignoreCase = true)
-                ) {
+                    key.contains("basket", ignoreCase = true) || key.contains("profile", ignoreCase = true)) {
+
                     fields[key] = when {
                         value.isNumber -> value.asInt()
                         value.isTextual -> value.asText()
@@ -131,31 +111,24 @@ class MyExtension : BurpExtension {
                     }
                 }
             }
-            return fields
-        } catch (_: Exception) {
-            return emptyMap()
-        }
+            fields
+        } catch (_: Exception) { emptyMap() } // Возвращаем пустую карту при невалидном JSON
     }
 
-    // ============================================================================
-    // ГЕНЕРАЦИЯ МУТАЦИЙ (БЕЗОПАСНАЯ)
-    // ============================================================================
+    // =========================================================================
+    // БЛОК МУТАЦИИ: Генерация модифицированных запросов для проверки IDOR
+    // =========================================================================
 
-    private fun generateMutatedRequests(
-        original: HttpRequest,
-        tracked: TrackedRequest,
-        victimIds: List<String> = listOf("1", "2", "3", "4", "5", "999")
-    ): List<Pair<String, HttpRequest>> {
+    private fun generateMutatedRequests(original: HttpRequest, tracked: TrackedRequest, victimIds: List<String> = listOf("1", "2", "3", "4", "5", "999")): List<Pair<String, HttpRequest>> {
         val mutations = mutableListOf<Pair<String, HttpRequest>>()
 
-        // 1. Мутация Cookie (базовая)
+        // 1. Мутация Cookie (базовая проверка на обход аутентификации)
         mutations.add("Cookie: подмена токена" to prepareModifiedRequest(original, "token=invalid_token_12345"))
 
-        // 2. Мутация URL Path Parameters
+        // 2. Мутация Path Parameters (замена ID в URL)
         for (param in tracked.pathParams) {
             for (victimId in victimIds) {
-                val newUrl = original.url().replaceFirst(param, "/$victimId")
-                mutations.add("PathParam: $param -> /$victimId" to original.withPath(newUrl))
+                mutations.add("PathParam: $param -> /$victimId" to original.withPath(original.url().replaceFirst(param, "/$victimId")))
             }
         }
 
@@ -163,68 +136,53 @@ class MyExtension : BurpExtension {
         for ((key, value) in tracked.queryParams) {
             for (victimId in victimIds) {
                 val urlParts = original.url().split("?", limit = 2)
-                val basePath = urlParts[0]
                 val query = if (urlParts.size > 1) urlParts[1] else ""
-
                 val newQueryParams = query.split("&").map { param ->
                     val kv = param.split("=", limit = 2)
                     if (kv.size == 2 && kv[0] == key) "$key=$victimId" else param
                 }.joinToString("&")
-
-                val newUrl = if (newQueryParams.isEmpty()) basePath else "$basePath?$newQueryParams"
+                val newUrl = if (newQueryParams.isEmpty()) urlParts[0] else "${urlParts[0]}?$newQueryParams"
                 mutations.add("QueryParam: $key=$value -> $key=$victimId" to original.withPath(newUrl))
             }
         }
 
-        // 4. Мутация JSON Body через AST (Abstract Syntax Tree).
-        // Использование ObjectNode предотвращает ошибки, которые возникали при простом String.replace()
-        // (например, замена "10" на "1" могла случайно изменить "100" на "10").
+        // 4. Мутация JSON Body (безопасная модификация через AST-дерево ObjectNode, а не через String.replace)
         if (original.bodyToString().isNotBlank()) {
             try {
-                val mapper = jacksonObjectMapper()
+                val mapper = ObjectMapper()
                 for ((key, value) in tracked.jsonBodyFields) {
                     for (victimId in victimIds) {
-                        // Парсим заново для каждой итерации, чтобы получить чистое дерево без сайд-эффектов
                         val mutationNode = mapper.readTree(original.bodyToString()) as ObjectNode
+                        // Сохраняем оригинальный тип данных (Int или String)
+                        if (value is Int) mutationNode.put(key, victimId.toIntOrNull() ?: 1)
+                        else mutationNode.put(key, victimId)
 
-                        if (value is Int) {
-                            mutationNode.put(key, victimId.toIntOrNull() ?: 1)
-                        } else {
-                            mutationNode.put(key, victimId)
-                        }
-
-                        val newBody = mapper.writeValueAsString(mutationNode)
-                        mutations.add("JsonBody: $key -> $victimId" to original.withBody(newBody))
+                        mutations.add("JsonBody: $key -> $victimId" to original.withBody(mapper.writeValueAsString(mutationNode)))
                     }
                 }
-            } catch (_: Exception) {
-                // Игнорируем невалидный JSON
-            }
+            } catch (_: Exception) { } // Игнорируем ошибки парсинга
         }
-
         return mutations
     }
 
-    // ============================================================================
-    // ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-    // ============================================================================
+    // =========================================================================
+    // БЛОК ВСПОМОГАТЕЛЬНЫХ ФУНКЦИЙ
+    // =========================================================================
 
-    private fun prepareModifiedRequest(original: HttpRequest, newCookieValue: String): HttpRequest {
-        return original
-            .withRemovedHeader("If-None-Match")
+    // Подготовка запроса: удаление заголовков кэша и подмена Cookie
+    private fun prepareModifiedRequest(original: HttpRequest, newCookieValue: String): HttpRequest =
+        original.withRemovedHeader("If-None-Match")
             .withRemovedHeader("If-Modified-Since")
             .withUpdatedHeader("Cache-Control", "no-cache")
             .withUpdatedHeader("Pragma", "no-cache")
             .withUpdatedHeader("Cookie", newCookieValue)
-    }
 
-    private fun sendRequest(api: MontoyaApi, request: HttpRequest): HttpResponse {
-        return api.http().sendRequest(request).response()
-    }
+    // Обертка для отправки запроса и извлечения только части с ответом
+    private fun sendRequest(api: MontoyaApi, request: HttpRequest): HttpResponse = api.http().sendRequest(request).response()
 
+    // Алгоритм Левенштейна для оценки семантической близости двух строк (тел ответов)
     private fun levenshteinDistance(s1: String, s2: String): Int {
-        val len1 = s1.length
-        val len2 = s2.length
+        val len1 = s1.length; val len2 = s2.length
         val dp = Array(len1 + 1) { IntArray(len2 + 1) }
         for (i in 0..len1) dp[i][0] = i
         for (j in 0..len2) dp[0][j] = j
@@ -237,132 +195,122 @@ class MyExtension : BurpExtension {
         return dp[len1][len2]
     }
 
-    // Детектор "Ложных 200 OK".
-    // Многие API возвращают статус 200, но в теле пишут {"error": "Unauthorized"}.
-    // Эта функция отсеивает такие ответы, предотвращая ложные срабатывания алгоритма Левенштейна.
+    // Детектор "Ложных 200 OK": проверяет наличие ключевых слов ошибок в теле ответа
     private fun isErrorResponse(body: String): Boolean {
-        val lowerBody = body.lowercase()
-        return lowerBody.contains("unauthorized") || lowerBody.contains("forbidden") ||
-                lowerBody.contains("not found") || lowerBody.contains("invalid") ||
-                lowerBody.contains("error") || lowerBody.contains("access denied") ||
-                lowerBody.contains("permission")
+        val lower = body.lowercase()
+        return lower.contains("unauthorized") || lower.contains("forbidden") || lower.contains("not found") ||
+                lower.contains("invalid") || lower.contains("error") || lower.contains("access denied") || lower.contains("permission")
     }
 
-    // ============================================================================
-    // ОРКЕСТРАЦИЯ ВНЕШНИХ ИНСТРУМЕНТОВ (NUCLEI)
-    // ============================================================================
+    // =========================================================================
+    // БЛОК ОРКЕСТРАЦИИ: Запуск внешнего сканера Nuclei
+    // =========================================================================
 
     private fun runNucleiScan(api: MontoyaApi, request: HttpRequest) {
         try {
-            val tempFile = File.createTempFile("nirs_req_", ".txt")
-            tempFile.writeText(request.toString()) // Сохраняем Raw HTTP с заголовками и CRLF
+            // Создание временного файла с Raw HTTP запросом
+            val tempFile = File.createTempFile("autoscan_req_", ".txt").apply { writeText(request.toString()) }
 
-            // ВАЖНО: Указан абсолютный путь, так как ProcessBuilder в Java не всегда видит системный $PATH
-            val command = listOf("/home/kali/go/bin/nuclei", "-l", tempFile.absolutePath, "-json", "-timeout", "30")
-
-            val processBuilder = ProcessBuilder(command)
-            processBuilder.redirectErrorStream(true) // Объединяем stdout и stderr
-
-            api.logging().logToOutput("[🛡️ NUCLEI] 🚀 Запуск сканирования: ${request.url()}")
+            // Настройка процесса: абсолютный путь к binary, вывод в JSON, таймаут
+            val processBuilder = ProcessBuilder(listOf("/home/kali/go/bin/nuclei", "-l", tempFile.absolutePath, "-json", "-timeout", "30")).apply { redirectErrorStream(true) }
+            api.logging().logToOutput("[NUCLEI] Запуск сканирования: ${request.url()}")
 
             val process = processBuilder.start()
             val reader = process.inputStream.bufferedReader()
-            val mapper = jacksonObjectMapper()
-
+            val mapper = ObjectMapper()
             var findingsCount = 0
-
-            // Чтение потока NDJSON (Newline Delimited JSON), который выдает Nuclei
             var line: String?
+
+            // Построчное чтение NDJSON вывода Nuclei
             while (reader.readLine().also { line = it } != null) {
                 try {
                     val jsonNode = mapper.readTree(line)
                     val info = jsonNode["info"]
-                    val name = info?.get("name")?.asText() ?: "Unknown"
                     val severity = info?.get("severity")?.asText()?.uppercase() ?: "UNKNOWN"
-                    val matchedAt = jsonNode["matched-at"]?.asText() ?: request.url()
 
                     // Фильтруем информационные сообщения, оставляем только реальные находки
                     if (severity != "INFO" && severity != "UNKNOWN") {
                         findingsCount++
-                        api.logging().logToOutput("[🛡️ NUCLEI] 🚨 НАЙДЕНО: [$severity] $name")
-                        api.logging().logToOutput("   📍 Цель: $matchedAt")
+                        api.logging().logToOutput("[NUCLEI] НАЙДЕНО: [$severity] ${info?.get("name")?.asText() ?: "Unknown"}")
+                        dashboard.addFinding(VulnerabilityFinding(
+                            url = jsonNode["matched-at"]?.asText() ?: request.url(),
+                            type = "Nuclei",
+                            severity = severity,
+                            details = info?.get("name")?.asText() ?: "Unknown",
+                            request = request
+                        ))
                     }
-                } catch (_: Exception) {
-                    // Игнорируем служебные строки Nuclei (например, о загрузке шаблонов), которые не являются JSON
-                }
+                } catch (_: Exception) { } // Игнорируем служебные строки, не являющиеся JSON
             }
 
             process.waitFor()
             tempFile.delete() // Очистка временных файлов
-
-            api.logging().logToOutput("[🛡️ NUCLEI] ✅ Сканирование завершено для: ${request.url()} (Найдено: $findingsCount)")
-
+            api.logging().logToOutput("[NUCLEI] Сканирование завершено для: ${request.url()} (Найдено: $findingsCount)")
         } catch (e: Exception) {
             api.logging().logToOutput("[!] Ошибка Nuclei: ${e.message}")
         }
     }
 
-    // ============================================================================
-    // ИЗМЕНЕНО: РАСШИРЕННЫЙ АЛГОРИТМ ДЕТЕКЦИИ IDOR
-    // ============================================================================
+    // =========================================================================
+    // БЛОК АНАЛИЗА: Основной алгоритм обнаружения IDOR
+    // =========================================================================
 
     private fun testIdorAdvanced(api: MontoyaApi, tracked: TrackedRequest) {
         try {
+            // 1. Формируем "чистый" запрос, очищенный от заголовков кэша браузера
             val cleanOriginalRequest = tracked.originalRequest
                 .withRemovedHeader("If-None-Match")
                 .withRemovedHeader("If-Modified-Since")
                 .withUpdatedHeader("Cache-Control", "no-cache")
 
+            // 2. Получаем базовую линию (Baseline)
             val originalResponse = sendRequest(api, cleanOriginalRequest)
 
-            if (originalResponse.statusCode() !in 200..299) return
+            // 3. Baseline Check: если исходный запрос уже неуспешен (не 2xx), искать IDOR бессмысленно
+            if (originalResponse.statusCode() !in 200..299) {
+                api.logging().logToOutput("[INFO] Пропуск анализа ${tracked.url}: исходный статус ${originalResponse.statusCode()} (требуется 2xx)")
+                return
+            }
 
-            // Генерируем не 1, а массив мутаций (Cookie, Path, Query, JSON)
-            val mutations = generateMutatedRequests(tracked.originalRequest, tracked)
+            // 4. Генерируем и проверяем все возможные мутации
             val vulnerableMutations = mutableListOf<String>()
-
-            for ((mutationType, mutatedRequest) in mutations) {
+            for ((mutationType, mutatedRequest) in generateMutatedRequests(cleanOriginalRequest, tracked)) {
                 val mutatedResponse = sendRequest(api, mutatedRequest)
 
-                val statusMatch = originalResponse.statusCode() == mutatedResponse.statusCode()
-                val lengthMatch = originalResponse.bodyToString().length == mutatedResponse.bodyToString().length
-                val distance = levenshteinDistance(originalResponse.bodyToString(), mutatedResponse.bodyToString())
-
-                // Проверка на наличие слов ошибки в теле ответа
-                val isError = isErrorResponse(mutatedResponse.bodyToString())
-
-                if (statusMatch && lengthMatch && distance < 50 && !isError) {
+                // Эвристика: статус совпал, длина совпала, текст почти не изменился (Левенштейн < 50), и это не страница ошибки
+                if (originalResponse.statusCode() == mutatedResponse.statusCode() &&
+                    originalResponse.bodyToString().length == mutatedResponse.bodyToString().length &&
+                    levenshteinDistance(originalResponse.bodyToString(), mutatedResponse.bodyToString()) < 50 &&
+                    !isErrorResponse(mutatedResponse.bodyToString())) {
                     vulnerableMutations.add(mutationType)
                 }
             }
 
-            // Консолидированный вывод. Без спама логов каждой проверкой,
-            // а выводим итоговый список подозрительных векторов, если они есть.
+            // 5. Формирование вердикта и исключение известных публичных эндпоинтов (False Positives)
             if (vulnerableMutations.isNotEmpty()) {
-                val isKnownPublic = tracked.url.contains("/api/Products") ||
-                        tracked.url.contains("/rest/languages") ||
-                        tracked.url.contains("/application-version") ||
-                        tracked.url.contains("/Challenges") ||
+                val isKnownPublic = tracked.url.contains("/api/Products") || tracked.url.contains("/rest/languages") ||
+                        tracked.url.contains("/application-version") || tracked.url.contains("/Challenges") ||
                         tracked.url.contains("/products/search")
 
-                if (isKnownPublic) {
-                    api.logging().logToOutput("[*] Игнорировано: Публичный эндпоинт ${tracked.url} (False Positive)")
-                } else {
-                    api.logging().logToOutput("[!] 🚨 НАЙДЕНА ПОТЕНЦИАЛЬНАЯ IDOR: ${tracked.url}")
-                    api.logging().logToOutput("[!] Подозрительные векторы:")
-                    vulnerableMutations.forEach { api.logging().logToOutput("    ➔ $it") }
-                    api.logging().logToOutput("[!] Рекомендуется проверить в Burp Repeater.")
+                if (!isKnownPublic) {
+                    api.logging().logToOutput("[!] НАЙДЕНА ПОТЕНЦИАЛЬНАЯ IDOR: ${tracked.url}")
+                    api.logging().logToOutput("[!] Подозрительные векторы: ${vulnerableMutations.joinToString(", ")}")
+
+                    // Добавляем находку в UI Dashboard
+                    dashboard.addFinding(VulnerabilityFinding(
+                        url = tracked.url,
+                        type = "IDOR",
+                        severity = "High",
+                        details = "Векторы: ${vulnerableMutations.joinToString(", ")}",
+                        request = cleanOriginalRequest // Сохраняем "чистый" запрос для Repeater
+                    ))
                 }
             }
 
-            // Триггер оркестрации. Если в запросе есть параметры, запускаем Nuclei параллельно.
-            val hasInjectionPoints = tracked.queryParams.isNotEmpty() || tracked.jsonBodyFields.isNotEmpty() || tracked.method == "POST"
-            if (hasInjectionPoints) {
-                thread(start = true, isDaemon = true) {
-                    runNucleiScan(api, tracked.originalRequest)
-                }
+            // 6. Триггер оркестрации: если в запросе есть параметры, запускаем параллельный скан Nuclei
+            if (tracked.queryParams.isNotEmpty() || tracked.jsonBodyFields.isNotEmpty() || tracked.method == "POST") {
+                thread(start = true, isDaemon = true) { runNucleiScan(api, cleanOriginalRequest) }
             }
-
         } catch (e: Exception) {
             api.logging().logToOutput("[!] Ошибка при анализе ${tracked.url}: ${e.message}")
         }
