@@ -11,6 +11,13 @@ import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.concurrent.thread
 import java.io.File
 
+// Результат проверки ответа сервера на наличие утечек
+enum class ResponseCheckResult {
+    SAFE,           // Нормальный ответ, нет признаков ошибок
+    ERROR_GENERIC,  // Стандартная ошибка (401, 403, 404), не содержит полезных данных
+    INFO_LEAK       // Ошибка с утечкой данных (Stack trace, SQL error, внутренние пути)
+}
+
 class MyExtension : BurpExtension {
     // Потокобезопасный список для хранения уникальных перехваченных запросов
     private val trackedRequests = CopyOnWriteArrayList<TrackedRequest>()
@@ -38,7 +45,9 @@ class MyExtension : BurpExtension {
 
                     if (cookieHeader != null) {
                         // Фильтр 2: Проверка наличия маркеров аутентификации
-                        val isAuthRequest = cookieHeader.contains("token", ignoreCase = true) || cookieHeader.contains("session", ignoreCase = true)
+                        val isAuthRequest = ScannerConfig.authMarkers.any { marker ->
+                            cookieHeader.contains(marker, ignoreCase = true)
+                        }
 
                         // Фильтр 3: Allowlist (белый список) целевых API-эндпоинтов
                         val isTargetApi = url.contains("/api/") || url.contains("/rest/") || url.contains("/profile") || url.contains("/basket") || url.contains("/ftp/") || url.contains("/admin")
@@ -84,25 +93,28 @@ class MyExtension : BurpExtension {
     private fun extractPathParams(url: String): List<String> =
         Regex("/(\\d+)(?=/|$)").findAll(url.substringBefore("?")).map { it.value }.toList()
 
-    // Парсит строку запроса (Query String) в Map ключ-значение
+    // Парсит строку запроса (Query String) в Map, оставляя только потенциально опасные параметры
     private fun extractQueryParams(url: String): Map<String, String> {
         val queryPart = url.substringAfter("?", "")
-        return if (queryPart.isEmpty()) emptyMap()
-        else queryPart.split("&").map { it.split("=", limit = 2) }.filter { it.size == 2 }.associate { it[0] to it[1] }
+        if (queryPart.isEmpty()) return emptyMap()
+
+        return queryPart.split("&")
+            .map { it.split("=", limit = 2) }
+            .filter { it.size == 2 }
+            // Фильтруем, оставляя только параметры из ScannerConfig.sensitiveFields
+            .filter { (key, _) -> ScannerConfig.sensitiveFields.any { field -> key.contains(field, ignoreCase = true) } }
+            .associate { it[0] to it[1] }
     }
 
-    // Анализирует JSON-тело и извлекает поля, которые с высокой вероятностью являются идентификаторами
+    // Анализирует JSON-тело и извлекает поля, которые с высокой вероятностью являются идентификаторами или параметрами прав
     private fun extractJsonBodyFields(body: String): Map<String, Any?> {
         if (body.isBlank()) return emptyMap()
         return try {
             val json = ObjectMapper().readTree(body)
             val fields = mutableMapOf<String, Any?>()
             json.fields().forEach { (key, value) ->
-                // Эвристика: ищем ключевые слова, характерные для ID-полей
-                if (key.contains("id", ignoreCase = true) || key.contains("user", ignoreCase = true) ||
-                    key.contains("account", ignoreCase = true) || key.contains("order", ignoreCase = true) ||
-                    key.contains("basket", ignoreCase = true) || key.contains("profile", ignoreCase = true)) {
-
+                // Эвристика: ищем ключевые слова, характерные для ID-полей и ролей
+                if (ScannerConfig.sensitiveFields.any { field -> key.contains(field, ignoreCase = true) }) {
                     fields[key] = when {
                         value.isNumber -> value.asInt()
                         value.isTextual -> value.asText()
@@ -116,7 +128,7 @@ class MyExtension : BurpExtension {
     }
 
     // =========================================================================
-    // БЛОК МУТАЦИИ: Генерация модифицированных запросов для проверки IDOR
+    // БЛОК МУТАЦИИ: Генерация модифицированных запросов для проверки IDOR и эскалации
     // =========================================================================
 
     private fun generateMutatedRequests(original: HttpRequest, tracked: TrackedRequest, victimIds: List<String> = listOf("1", "2", "3", "4", "5", "999")): List<Pair<String, HttpRequest>> {
@@ -127,14 +139,14 @@ class MyExtension : BurpExtension {
 
         // 2. Мутация Path Parameters (замена ID в URL)
         for (param in tracked.pathParams) {
-            for (victimId in victimIds) {
+            for (victimId in ScannerConfig.victimIds) {
                 mutations.add("PathParam: $param -> /$victimId" to original.withPath(original.url().replaceFirst(param, "/$victimId")))
             }
         }
 
         // 3. Мутация Query Parameters (безопасная пересборка URL)
         for ((key, value) in tracked.queryParams) {
-            for (victimId in victimIds) {
+            for (victimId in ScannerConfig.victimIds) {
                 val urlParts = original.url().split("?", limit = 2)
                 val query = if (urlParts.size > 1) urlParts[1] else ""
                 val newQueryParams = query.split("&").map { param ->
@@ -150,6 +162,8 @@ class MyExtension : BurpExtension {
         if (original.bodyToString().isNotBlank()) {
             try {
                 val mapper = ObjectMapper()
+
+                // 4.1. Стандартная мутация ID-полей
                 for ((key, value) in tracked.jsonBodyFields) {
                     for (victimId in victimIds) {
                         val mutationNode = mapper.readTree(original.bodyToString()) as ObjectNode
@@ -158,6 +172,25 @@ class MyExtension : BurpExtension {
                         else mutationNode.put(key, victimId)
 
                         mutations.add("JsonBody: $key -> $victimId" to original.withBody(mapper.writeValueAsString(mutationNode)))
+                    }
+                }
+
+                // 4.2. Мутация привилегий и ролей (Вертикальная эскалация)
+                val roleFields = tracked.jsonBodyFields.keys.filter { k ->
+                    ScannerConfig.sensitiveFields.any { field ->
+                        k.contains(field, ignoreCase = true) && (field.contains("role") || field.contains("admin") || field.contains("privilege"))
+                    }
+                }
+
+                for (field in roleFields) {
+                    for (payload in ScannerConfig.privilegePayloads) {
+                        val mutationNode = mapper.readTree(original.bodyToString()) as ObjectNode
+                        if (payload == "true") mutationNode.put(field, true)
+                        else if (payload == "false") mutationNode.put(field, false)
+                        else if (payload.toIntOrNull() != null) mutationNode.put(field, payload.toInt())
+                        else mutationNode.put(field, payload)
+
+                        mutations.add("PrivilegeEscalation: $field -> $payload" to original.withBody(mapper.writeValueAsString(mutationNode)))
                     }
                 }
             } catch (_: Exception) { } // Игнорируем ошибки парсинга
@@ -195,16 +228,109 @@ class MyExtension : BurpExtension {
         return dp[len1][len2]
     }
 
-    // Детектор "Ложных 200 OK": проверяет наличие ключевых слов ошибок в теле ответа
-    private fun isErrorResponse(body: String): Boolean {
+    // Проверка ответа на наличие утечек информации (Info Disclosure)
+    private fun checkResponseForLeaks(body: String): ResponseCheckResult {
         val lower = body.lowercase()
-        return lower.contains("unauthorized") || lower.contains("forbidden") || lower.contains("not found") ||
-                lower.contains("invalid") || lower.contains("error") || lower.contains("access denied") || lower.contains("permission")
+
+        if (ScannerConfig.infoLeakKeywords.any { lower.contains(it) }) {
+            return ResponseCheckResult.INFO_LEAK
+        }
+
+        if (ScannerConfig.genericErrors.any { lower.contains(it) }) {
+            return ResponseCheckResult.ERROR_GENERIC
+        }
+
+        return ResponseCheckResult.SAFE
     }
 
     // =========================================================================
-    // БЛОК ОРКЕСТРАЦИИ: Запуск внешнего сканера Nuclei
+    // БЛОК АНАЛИЗА И ОРКЕСТРАЦИИ
     // =========================================================================
+
+    private fun testIdorAdvanced(api: MontoyaApi, tracked: TrackedRequest) {
+        try {
+            // 1. Формируем "чистый" запрос, очищенный от заголовков кэша браузера
+            val cleanOriginalRequest = tracked.originalRequest
+                .withRemovedHeader("If-None-Match")
+                .withRemovedHeader("If-Modified-Since")
+                .withUpdatedHeader("Cache-Control", "no-cache")
+
+            // 2. Получаем базовую линию (Baseline)
+            val originalResponse = sendRequest(api, cleanOriginalRequest)
+
+            // 3. Baseline Check: если исходный запрос неуспешен (не 2xx), проверяем его на Info Disclosure, иначе пропускаем
+            if (originalResponse.statusCode() !in 200..299) {
+                if (checkResponseForLeaks(originalResponse.bodyToString()) == ResponseCheckResult.INFO_LEAK) {
+                    api.logging().logToOutput("[!] НАЙДЕНА УТЕЧКА ИНФОРМАЦИИ (в исходном ответе): ${tracked.url}")
+                    dashboard.addFinding(VulnerabilityFinding(
+                        url = tracked.url,
+                        type = "Info Disclosure",
+                        severity = "Medium",
+                        details = "Исходный запрос вернул ошибку (${originalResponse.statusCode()}) с признаками утечки (stack trace, SQL error и т.д.)",
+                        request = cleanOriginalRequest
+                    ))
+                }
+                api.logging().logToOutput("[INFO] Пропуск анализа ${tracked.url}: исходный статус ${originalResponse.statusCode()} (требуется 2xx)")
+                return
+            }
+
+            // 4. Генерируем и проверяем все возможные мутации
+            val vulnerableMutations = mutableListOf<String>()
+            for ((mutationType, mutatedRequest) in generateMutatedRequests(cleanOriginalRequest, tracked)) {
+                val mutatedResponse = sendRequest(api, mutatedRequest)
+                val checkResult = checkResponseForLeaks(mutatedResponse.bodyToString())
+
+                // СЦЕНАРИЙ А: Обнаружена утечка информации (Info Disclosure)
+                if (checkResult == ResponseCheckResult.INFO_LEAK) {
+                    api.logging().logToOutput("[!] НАЙДЕНА УТЕЧКА ИНФОРМАЦИИ (Info Disclosure): ${tracked.url}")
+                    dashboard.addFinding(VulnerabilityFinding(
+                        url = tracked.url,
+                        type = "Info Disclosure",
+                        severity = "Medium",
+                        details = "Ответ содержит признаки утечки при мутации: $mutationType",
+                        request = mutatedRequest
+                    ))
+                }
+                // СЦЕНАРИЙ Б: Ответ безопасен, проверяем на классический IDOR
+                else if (checkResult != ResponseCheckResult.ERROR_GENERIC) {
+                    if (originalResponse.statusCode() == mutatedResponse.statusCode() &&
+                        originalResponse.bodyToString().length == mutatedResponse.bodyToString().length &&
+                        levenshteinDistance(originalResponse.bodyToString(), mutatedResponse.bodyToString()) < 50) {
+                        vulnerableMutations.add(mutationType)
+                    }
+                }
+            }
+
+            // 5. Формирование вердикта и исключение известных публичных эндпоинтов (False Positives)
+            if (vulnerableMutations.isNotEmpty()) {
+                val isKnownPublic = ScannerConfig.publicEndpoints.any { endpoint ->
+                    tracked.url.contains(endpoint, ignoreCase = true)
+                }
+
+                if (isKnownPublic) {
+                    api.logging().logToOutput("[*] Игнорировано: Публичный эндпоинт ${tracked.url} (False Positive)")
+                } else {
+                    api.logging().logToOutput("[!] НАЙДЕНА ПОТЕНЦИАЛЬНАЯ IDOR: ${tracked.url}")
+                    api.logging().logToOutput("[!] Подозрительные векторы: ${vulnerableMutations.joinToString(", ")}")
+
+                    dashboard.addFinding(VulnerabilityFinding(
+                        url = tracked.url,
+                        type = "IDOR",
+                        severity = "High",
+                        details = "Векторы: ${vulnerableMutations.joinToString(", ")}",
+                        request = cleanOriginalRequest
+                    ))
+                }
+            }
+
+            // 6. Триггер оркестрации: если в запросе есть параметры, запускаем параллельный скан Nuclei
+            if (tracked.queryParams.isNotEmpty() || tracked.jsonBodyFields.isNotEmpty() || tracked.method == "POST") {
+                thread(start = true, isDaemon = true) { runNucleiScan(api, cleanOriginalRequest) }
+            }
+        } catch (e: Exception) {
+            api.logging().logToOutput("[!] Ошибка при анализе ${tracked.url}: ${e.message}")
+        }
+    }
 
     private fun runNucleiScan(api: MontoyaApi, request: HttpRequest) {
         try {
@@ -248,71 +374,6 @@ class MyExtension : BurpExtension {
             api.logging().logToOutput("[NUCLEI] Сканирование завершено для: ${request.url()} (Найдено: $findingsCount)")
         } catch (e: Exception) {
             api.logging().logToOutput("[!] Ошибка Nuclei: ${e.message}")
-        }
-    }
-
-    // =========================================================================
-    // БЛОК АНАЛИЗА: Основной алгоритм обнаружения IDOR
-    // =========================================================================
-
-    private fun testIdorAdvanced(api: MontoyaApi, tracked: TrackedRequest) {
-        try {
-            // 1. Формируем "чистый" запрос, очищенный от заголовков кэша браузера
-            val cleanOriginalRequest = tracked.originalRequest
-                .withRemovedHeader("If-None-Match")
-                .withRemovedHeader("If-Modified-Since")
-                .withUpdatedHeader("Cache-Control", "no-cache")
-
-            // 2. Получаем базовую линию (Baseline)
-            val originalResponse = sendRequest(api, cleanOriginalRequest)
-
-            // 3. Baseline Check: если исходный запрос уже неуспешен (не 2xx), искать IDOR бессмысленно
-            if (originalResponse.statusCode() !in 200..299) {
-                api.logging().logToOutput("[INFO] Пропуск анализа ${tracked.url}: исходный статус ${originalResponse.statusCode()} (требуется 2xx)")
-                return
-            }
-
-            // 4. Генерируем и проверяем все возможные мутации
-            val vulnerableMutations = mutableListOf<String>()
-            for ((mutationType, mutatedRequest) in generateMutatedRequests(cleanOriginalRequest, tracked)) {
-                val mutatedResponse = sendRequest(api, mutatedRequest)
-
-                // Эвристика: статус совпал, длина совпала, текст почти не изменился (Левенштейн < 50), и это не страница ошибки
-                if (originalResponse.statusCode() == mutatedResponse.statusCode() &&
-                    originalResponse.bodyToString().length == mutatedResponse.bodyToString().length &&
-                    levenshteinDistance(originalResponse.bodyToString(), mutatedResponse.bodyToString()) < 50 &&
-                    !isErrorResponse(mutatedResponse.bodyToString())) {
-                    vulnerableMutations.add(mutationType)
-                }
-            }
-
-            // 5. Формирование вердикта и исключение известных публичных эндпоинтов (False Positives)
-            if (vulnerableMutations.isNotEmpty()) {
-                val isKnownPublic = tracked.url.contains("/api/Products") || tracked.url.contains("/rest/languages") ||
-                        tracked.url.contains("/application-version") || tracked.url.contains("/Challenges") ||
-                        tracked.url.contains("/products/search")
-
-                if (!isKnownPublic) {
-                    api.logging().logToOutput("[!] НАЙДЕНА ПОТЕНЦИАЛЬНАЯ IDOR: ${tracked.url}")
-                    api.logging().logToOutput("[!] Подозрительные векторы: ${vulnerableMutations.joinToString(", ")}")
-
-                    // Добавляем находку в UI Dashboard
-                    dashboard.addFinding(VulnerabilityFinding(
-                        url = tracked.url,
-                        type = "IDOR",
-                        severity = "High",
-                        details = "Векторы: ${vulnerableMutations.joinToString(", ")}",
-                        request = cleanOriginalRequest // Сохраняем "чистый" запрос для Repeater
-                    ))
-                }
-            }
-
-            // 6. Триггер оркестрации: если в запросе есть параметры, запускаем параллельный скан Nuclei
-            if (tracked.queryParams.isNotEmpty() || tracked.jsonBodyFields.isNotEmpty() || tracked.method == "POST") {
-                thread(start = true, isDaemon = true) { runNucleiScan(api, cleanOriginalRequest) }
-            }
-        } catch (e: Exception) {
-            api.logging().logToOutput("[!] Ошибка при анализе ${tracked.url}: ${e.message}")
         }
     }
 }

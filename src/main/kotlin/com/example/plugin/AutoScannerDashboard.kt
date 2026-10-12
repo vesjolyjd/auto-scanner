@@ -39,11 +39,26 @@ class FindingsTableModel(val findings: MutableList<VulnerabilityFinding>) : Abst
     fun clearAll() { val size = findings.size; if (size > 0) { findings.clear(); fireTableRowsDeleted(0, size - 1) } }
 }
 
-// Рендерер для раскраски текста уровня критичности (Severity)
-class SeverityCellRenderer : javax.swing.table.DefaultTableCellRenderer() {
+// Рендерер для раскраски текста уровня критичности (Severity) + фон строки
+class SeverityCellRenderer(private val table: JTable) : javax.swing.table.DefaultTableCellRenderer() {
     override fun getTableCellRendererComponent(table: JTable?, value: Any?, isSelected: Boolean, hasFocus: Boolean, row: Int, column: Int): Component {
         val component = super.getTableCellRendererComponent(table, value, isSelected, hasFocus, row, column)
         val severity = value?.toString()?.uppercase() ?: ""
+
+        // Цвет фона строки (синхронизирован с RowBackgroundRenderer)
+        if (!isSelected) {
+            component.background = when {
+                severity.contains("CRITICAL") -> Color(255, 230, 230)
+                severity.contains("HIGH") -> Color(255, 240, 220)
+                severity.contains("MEDIUM") -> Color(255, 250, 220)
+                severity.contains("LOW") -> Color(230, 240, 255)
+                else -> Color.WHITE
+            }
+        } else {
+            component.background = table?.selectionBackground ?: Color(200, 220, 255)
+        }
+
+        // Цвет текста Severity
         if (!isSelected) {
             component.foreground = when {
                 severity.contains("CRITICAL") -> Color(220, 20, 60) // Crimson
@@ -59,7 +74,7 @@ class SeverityCellRenderer : javax.swing.table.DefaultTableCellRenderer() {
     }
 }
 
-// Рендерер для раскраски фона всей строки в зависимости от Severity
+// Рендерер для фона строки (с tooltip для длинного текста)
 class RowBackgroundRenderer(private val table: JTable) : javax.swing.table.DefaultTableCellRenderer() {
     override fun getTableCellRendererComponent(table: JTable?, value: Any?, isSelected: Boolean, hasFocus: Boolean, row: Int, column: Int): Component {
         val component = super.getTableCellRendererComponent(table, value, isSelected, hasFocus, row, column)
@@ -78,7 +93,69 @@ class RowBackgroundRenderer(private val table: JTable) : javax.swing.table.Defau
         } else {
             component.background = table?.selectionBackground ?: Color(200, 220, 255)
         }
+
+        // Добавляем tooltip для длинного текста (URL и Details)
+        if (value != null && value.toString().length > 60) {
+            (component as JComponent).toolTipText = "<html><body style='width: 400px;'>${value.toString().replace("\n", "<br>")}</body></html>"
+        } else {
+            (component as JComponent).toolTipText = null
+        }
+
         return component
+    }
+}
+
+// Специальный рендерер для колонки Details: использует JTextArea для многострочного текста
+class DetailsCellRenderer(private val table: JTable) : javax.swing.table.TableCellRenderer {
+
+    private val textArea = JTextArea().apply {
+        isOpaque = true
+        lineWrap = true
+        wrapStyleWord = true
+        border = BorderFactory.createEmptyBorder(4, 6, 4, 6)
+        font = Font("SansSerif", Font.PLAIN, 12)
+        margin = Insets(2, 4, 2, 4)
+    }
+
+    override fun getTableCellRendererComponent(table: JTable?, value: Any?, isSelected: Boolean, hasFocus: Boolean, row: Int, column: Int): Component {
+        // 1. Применяем цвет фона как у всей строки
+        val modelRow = table?.convertRowIndexToModel(row) ?: row
+        val model = table?.model as? FindingsTableModel
+        val severity = model?.let { if (modelRow < it.findings.size) it.findings[modelRow].severity.uppercase() else "" } ?: ""
+
+        textArea.background = if (!isSelected) {
+            when {
+                severity.contains("CRITICAL") -> Color(255, 230, 230)
+                severity.contains("HIGH") -> Color(255, 240, 220)
+                severity.contains("MEDIUM") -> Color(255, 250, 220)
+                severity.contains("LOW") -> Color(230, 240, 255)
+                else -> Color.WHITE
+            }
+        } else {
+            table?.selectionBackground ?: Color(200, 220, 255)
+        }
+
+        textArea.foreground = if (!isSelected) Color.BLACK else table?.selectionForeground ?: Color.BLACK
+
+        // 2. Форматируем текст БЕЗ добавления маркеров (они уже есть в тексте)
+        val rawText = value?.toString() ?: ""
+        val lines = rawText.split("\n").filter { it.isNotBlank() }
+
+        // Если строк больше 3, сокращаем
+        val displayText = if (lines.size > 3) {
+            val preview = lines.take(3).joinToString("\n")
+            "$preview\n… и ещё ${lines.size - 3}"
+        } else {
+            lines.joinToString("\n")
+        }
+
+        // 3. Устанавливаем текст
+        textArea.text = displayText
+
+        // 4. Tooltip с полным текстом
+        textArea.toolTipText = rawText
+
+        return textArea
     }
 }
 
@@ -93,23 +170,33 @@ class AutoScannerDashboardPanel(private val api: MontoyaApi) : JPanel() {
     // Инициализация и настройка внешнего вида JTable
     private val table = JTable(tableModel).apply {
         autoResizeMode = JTable.AUTO_RESIZE_LAST_COLUMN
-        rowHeight = 24
+        rowHeight = 70
         rowSelectionAllowed = true
-        setSelectionMode(ListSelectionModel.SINGLE_SELECTION) // Разрешен выбор только одной строки
+        setSelectionMode(ListSelectionModel.SINGLE_SELECTION)
         tableHeader.reorderingAllowed = false
         gridColor = Color(220, 220, 220)
         setShowGrid(true)
-        rowSorter = TableRowSorter(tableModel) // Включаем сортировку по клику на заголовок
+        rowSorter = TableRowSorter(tableModel) // Сортировка по клику на заголовок
 
-        // Применяем кастомные рендереры
-        getColumnModel().getColumn(2).cellRenderer = SeverityCellRenderer()
-        for (i in 0 until columnCount) getColumnModel().getColumn(i).cellRenderer = RowBackgroundRenderer(this)
+        // Применяем рендереры ко всем колонкам
+        for (i in 0 until columnCount) {
+            if (i == 4) {
+                // Для Details используем рендерер с JTextArea
+                getColumnModel().getColumn(i).cellRenderer = DetailsCellRenderer(this)
+            } else if (i == 2) {
+                // Для Severity используем комбинированный рендерер (фон + цвет текста)
+                getColumnModel().getColumn(i).cellRenderer = SeverityCellRenderer(this)
+            } else {
+                // Для остальных (включая URL) используем стандартный рендерер с фоном
+                getColumnModel().getColumn(i).cellRenderer = RowBackgroundRenderer(this)
+            }
+        }
 
-        // Настройка ширины колонок
+        // Ширины колонок
         getColumnModel().getColumn(0).apply { preferredWidth = 40; maxWidth = 50 }
-        getColumnModel().getColumn(1).apply { preferredWidth = 70; maxWidth = 100 }
+        getColumnModel().getColumn(1).apply { preferredWidth = 130; maxWidth = 150 }
         getColumnModel().getColumn(2).apply { preferredWidth = 80; maxWidth = 100 }
-        getColumnModel().getColumn(4).preferredWidth = 200
+        getColumnModel().getColumn(4).preferredWidth = 350
         getColumnModel().getColumn(5).apply { preferredWidth = 80; maxWidth = 100 }
     }
 
@@ -117,7 +204,7 @@ class AutoScannerDashboardPanel(private val api: MontoyaApi) : JPanel() {
 
     // Элементы управления (фильтры и поиск)
     private val searchField = JTextField()
-    private val typeFilter = JComboBox(arrayOf("All Types", "IDOR", "Nuclei"))
+    private val typeFilter = JComboBox(arrayOf("All Types", "IDOR", "Nuclei", "Info Disclosure"))
     private val severityFilter = JComboBox(arrayOf("All Severities", "CRITICAL", "HIGH", "MEDIUM", "LOW"))
 
     // Элементы статистики
@@ -128,6 +215,30 @@ class AutoScannerDashboardPanel(private val api: MontoyaApi) : JPanel() {
     private val lowCountLabel = JLabel("Low: 0")
 
     init {
+        // Динамическое изменение размера колонки Details при двойном клике на заголовок
+        table.tableHeader.addMouseListener(object : java.awt.event.MouseAdapter() {
+            override fun mouseClicked(e: java.awt.event.MouseEvent) {
+                if (e.clickCount == 2) {
+                    val col = table.tableHeader.columnAtPoint(e.point)
+                    if (col == 4) { // Колонка Details (индекс 4)
+                        var maxWidth = 350
+                        for (i in 0 until table.rowCount) {
+                            val renderer = table.getCellRenderer(i, col)
+                            val comp = renderer.getTableCellRendererComponent(
+                                table, table.getValueAt(i, col), false, false, i, col
+                            )
+                            maxWidth = maxOf(maxWidth, comp.preferredSize.width)
+                        }
+                        val targetWidth = minOf(maxWidth + 20, 800)
+                        val column = table.columnModel.getColumn(col)
+                        column.preferredWidth = targetWidth
+                        column.width = targetWidth // Принудительно устанавливаем текущую ширину
+                        table.doLayout() // Заставляем таблицу немедленно пересчитать макет
+                    }
+                }
+            }
+        })
+
         layout = BorderLayout()
 
         // 1. Верхняя панель инструментов (Toolbar)
@@ -137,7 +248,19 @@ class AutoScannerDashboardPanel(private val api: MontoyaApi) : JPanel() {
         toolBar.add(JLabel("Type: ")); toolBar.add(typeFilter); toolBar.add(Box.createHorizontalStrut(10))
         toolBar.add(JLabel("Severity: ")); toolBar.add(severityFilter); toolBar.add(Box.createHorizontalStrut(10))
         toolBar.add(JButton("Clear All").apply { toolTipText = "Удалить все записи"; addActionListener { clearAllFindings() } })
-        toolBar.add(JButton("Export JSON").apply { toolTipText = "Экспортировать находки в JSON-файл"; addActionListener { exportToJson() } })
+        toolBar.add(JButton("Export JSON").apply { toolTipText = "Экспортировать находки"; addActionListener { exportToJson() } })
+        toolBar.add(Box.createHorizontalGlue())
+
+        // Кнопка открытия диалога настроек
+        val settingsBtn = JButton("⚙️ Настройки").apply {
+            toolTipText = "Изменить списки эвристик и правил сканера"
+            addActionListener {
+                val dialog = SettingsDialog(null)
+                dialog.isVisible = true
+            }
+        }
+        toolBar.add(settingsBtn)
+
         add(toolBar, BorderLayout.NORTH)
 
         // 2. Центральная область с таблицей
@@ -163,7 +286,6 @@ class AutoScannerDashboardPanel(private val api: MontoyaApi) : JPanel() {
         add(bottomPanel, BorderLayout.SOUTH)
 
         // 4. Обработчики событий (Реактивность UI)
-        // Живой поиск при вводе текста
         searchField.document.addDocumentListener(object : javax.swing.event.DocumentListener {
             override fun insertUpdate(e: javax.swing.event.DocumentEvent?) = applyFilters()
             override fun removeUpdate(e: javax.swing.event.DocumentEvent?) = applyFilters()
@@ -174,7 +296,15 @@ class AutoScannerDashboardPanel(private val api: MontoyaApi) : JPanel() {
 
         // Обработка мыши (двойной клик и контекстное меню)
         table.addMouseListener(object : MouseAdapter() {
-            override fun mouseClicked(e: MouseEvent) { if (e.clickCount == 2) openSelectedInRepeater() }
+            override fun mouseClicked(e: MouseEvent) {
+                if (e.clickCount == 2) {
+                    // Проверяем, что клик был по строке, а не по заголовку (row >= 0)
+                    val row = table.rowAtPoint(e.point)
+                    if (row >= 0) {
+                        openSelectedInRepeater()
+                    }
+                }
+            }
             override fun mousePressed(e: MouseEvent) = showPopup(e)
             override fun mouseReleased(e: MouseEvent) = showPopup(e)
             private fun showPopup(e: MouseEvent) {
@@ -185,6 +315,10 @@ class AutoScannerDashboardPanel(private val api: MontoyaApi) : JPanel() {
                         JPopupMenu().apply {
                             add(JMenuItem("Open in Repeater").apply { addActionListener { openSelectedInRepeater() } })
                             add(JMenuItem("Copy URL").apply { addActionListener { copySelectedUrl() } })
+                            // Копирование деталей находки
+                            add(JMenuItem("Copy Details").apply {
+                                addActionListener { copySelectedDetails() }
+                            })
                             addSeparator()
                             add(JMenuItem("Delete").apply { addActionListener { deleteSelected() } })
                         }.show(table, e.x, e.y)
@@ -241,6 +375,15 @@ class AutoScannerDashboardPanel(private val api: MontoyaApi) : JPanel() {
         Toolkit.getDefaultToolkit().systemClipboard.setContents(StringSelection(findingsList[table.convertRowIndexToModel(selectedRow)].url), null)
     }
 
+    // Копирование Details в системный буфер обмена
+    private fun copySelectedDetails() {
+        val selectedRow = table.selectedRow
+        if (selectedRow == -1) return
+        val modelRow = table.convertRowIndexToModel(selectedRow)
+        val details = findingsList[modelRow].details
+        Toolkit.getDefaultToolkit().systemClipboard.setContents(StringSelection(details), null)
+    }
+
     // Удаление выбранной строки из таблицы и модели
     private fun deleteSelected() {
         val selectedRow = table.selectedRow; if (selectedRow == -1) return
@@ -281,10 +424,28 @@ class AutoScannerDashboardPanel(private val api: MontoyaApi) : JPanel() {
     }
 
     // Публичный метод для добавления новой находки из фонового потока (безопасно для Swing через invokeLater)
-    fun addFinding(finding: VulnerabilityFinding) {
+    fun addFinding(newFinding: VulnerabilityFinding) {
         SwingUtilities.invokeLater {
-            findingsList.add(finding)
-            tableModel.fireTableRowsInserted(findingsList.size - 1, findingsList.size - 1)
+            // Ищем, есть ли уже такая находка по URL и типу
+            val existingIndex = findingsList.indexOfFirst { it.url == newFinding.url && it.type == newFinding.type }
+
+            if (existingIndex != -1) {
+                // Если есть, объединяем детали (чтобы не плодить дубликаты в таблице)
+                val existing = findingsList[existingIndex]
+                val mergedDetails = if (existing.details.contains(newFinding.details)) {
+                    existing.details
+                } else {
+                    "${existing.details}\n• ${newFinding.details}"
+                }
+                val mergedFinding = existing.copy(details = mergedDetails, request = newFinding.request)
+
+                findingsList[existingIndex] = mergedFinding
+                tableModel.fireTableRowsUpdated(existingIndex, existingIndex)
+            } else {
+                // Если нет, добавляем новую
+                findingsList.add(newFinding)
+                tableModel.fireTableRowsInserted(findingsList.size - 1, findingsList.size - 1)
+            }
             updateStats()
         }
     }
