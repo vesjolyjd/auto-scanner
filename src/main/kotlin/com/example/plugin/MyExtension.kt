@@ -2,14 +2,15 @@ package com.example.plugin
 
 import burp.api.montoya.BurpExtension
 import burp.api.montoya.MontoyaApi
+import burp.api.montoya.core.ToolType
 import burp.api.montoya.http.handler.*
 import burp.api.montoya.http.message.requests.HttpRequest
 import burp.api.montoya.http.message.responses.HttpResponse
-import com.fasterxml.jackson.databind.node.ObjectNode
 import com.fasterxml.jackson.databind.ObjectMapper
+import com.fasterxml.jackson.databind.node.ObjectNode
+import java.io.File
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.concurrent.thread
-import java.io.File
 
 // Результат проверки ответа сервера на наличие утечек
 enum class ResponseCheckResult {
@@ -22,6 +23,9 @@ class MyExtension : BurpExtension {
     // Потокобезопасный список для хранения уникальных перехваченных запросов
     private val trackedRequests = CopyOnWriteArrayList<TrackedRequest>()
     private lateinit var dashboard: AutoScannerDashboardPanel
+
+    // Множество для предотвращения спама одинаковых сообщений об утечках в консоль
+    private val loggedInfoLeaks = mutableSetOf<String>()
 
     override fun initialize(api: MontoyaApi) {
         // Инициализация имени плагина и приветственных логов
@@ -39,7 +43,7 @@ class MyExtension : BurpExtension {
         api.http().registerHttpHandler(object : HttpHandler {
             override fun handleHttpRequestToBeSent(requestToBeSent: HttpRequestToBeSent): RequestToBeSentAction {
                 // Фильтр 1: Обрабатываем только трафик из браузера (Proxy), игнорируя внутренние запросы Burp
-                if (requestToBeSent.toolSource().isFromTool(burp.api.montoya.core.ToolType.PROXY)) {
+                if (requestToBeSent.toolSource().isFromTool(ToolType.PROXY)) {
                     val cookieHeader = requestToBeSent.headerValue("Cookie")
                     val url = requestToBeSent.url()
 
@@ -50,7 +54,9 @@ class MyExtension : BurpExtension {
                         }
 
                         // Фильтр 3: Allowlist (белый список) целевых API-эндпоинтов
-                        val isTargetApi = url.contains("/api/") || url.contains("/rest/") || url.contains("/profile") || url.contains("/basket") || url.contains("/ftp/") || url.contains("/admin")
+                        val isTargetApi = url.contains("/api/") || url.contains("/rest/") ||
+                                url.contains("/profile") || url.contains("/basket") ||
+                                url.contains("/ftp/") || url.contains("/admin")
 
                         // Фильтр 4: Игнорирование артефактов фронтенда (NaN, undefined)
                         if (isAuthRequest && isTargetApi && !url.contains("/NaN") && !url.contains("/undefined")) {
@@ -70,8 +76,15 @@ class MyExtension : BurpExtension {
                                 trackedRequests.add(tracked)
                                 api.logging().logToOutput("[INFO] Целевой запрос сохранен: ${tracked.method} ${tracked.url}")
 
+                                // Обновляем счетчик очереди в UI
+                                dashboard.updateQueueSize(trackedRequests.size)
+
                                 // Асинхронный запуск анализа в фоновом потоке (Daemon), чтобы не блокировать UI Burp
-                                thread(start = true, isDaemon = true) { testIdorAdvanced(api, tracked) }
+                                thread(start = true, isDaemon = true) {
+                                    testIdorAdvanced(api, tracked)
+                                    // Уменьшаем счетчик очереди после завершения анализа
+                                    dashboard.updateQueueSize(trackedRequests.size - 1)
+                                }
                             }
                         }
                     }
@@ -89,9 +102,20 @@ class MyExtension : BurpExtension {
     // БЛОК ПАРСИНГА: Извлечение параметров из запроса для последующей мутации
     // =========================================================================
 
-    // Извлекает числовые значения из пути URL (например, "/users/5" -> ["/5"])
-    private fun extractPathParams(url: String): List<String> =
-        Regex("/(\\d+)(?=/|$)").findAll(url.substringBefore("?")).map { it.value }.toList()
+    // Извлекает числовые значения, UUID и префиксные ID из пути URL
+    private fun extractPathParams(url: String): List<String> {
+        val path = url.substringBefore("?")
+        val results = mutableListOf<String>()
+
+        // 1. Обычные числа
+        results.addAll(Regex("/(\\d+)(?=/|$)").findAll(path).map { it.value }.toList())
+        // 2. UUID
+        results.addAll(ScannerConfig.uuidRegex.findAll(path).map { it.value }.toList())
+        // 3. Префиксные ID (например, /cart/user_123 -> извлекаем "user_123")
+        results.addAll(ScannerConfig.prefixedIdRegex.findAll(path).map { it.value }.toList())
+
+        return results.distinct()
+    }
 
     // Парсит строку запроса (Query String) в Map, оставляя только потенциально опасные параметры
     private fun extractQueryParams(url: String): Map<String, String> {
@@ -124,14 +148,16 @@ class MyExtension : BurpExtension {
                 }
             }
             fields
-        } catch (_: Exception) { emptyMap() } // Возвращаем пустую карту при невалидном JSON
+        } catch (_: Exception) {
+            emptyMap() // Возвращаем пустую карту при невалидном JSON
+        }
     }
 
     // =========================================================================
     // БЛОК МУТАЦИИ: Генерация модифицированных запросов для проверки IDOR и эскалации
     // =========================================================================
 
-    private fun generateMutatedRequests(original: HttpRequest, tracked: TrackedRequest, victimIds: List<String> = listOf("1", "2", "3", "4", "5", "999")): List<Pair<String, HttpRequest>> {
+    private fun generateMutatedRequests(original: HttpRequest, tracked: TrackedRequest): List<Pair<String, HttpRequest>> {
         val mutations = mutableListOf<Pair<String, HttpRequest>>()
 
         // 1. Мутация Cookie (базовая проверка на обход аутентификации)
@@ -158,14 +184,14 @@ class MyExtension : BurpExtension {
             }
         }
 
-        // 4. Мутация JSON Body (безопасная модификация через AST-дерево ObjectNode, а не через String.replace)
+        // 4. Мутация JSON Body (безопасная модификация через AST-дерево ObjectNode)
         if (original.bodyToString().isNotBlank()) {
             try {
                 val mapper = ObjectMapper()
 
                 // 4.1. Стандартная мутация ID-полей
                 for ((key, value) in tracked.jsonBodyFields) {
-                    for (victimId in victimIds) {
+                    for (victimId in ScannerConfig.victimIds) {
                         val mutationNode = mapper.readTree(original.bodyToString()) as ObjectNode
                         // Сохраняем оригинальный тип данных (Int или String)
                         if (value is Int) mutationNode.put(key, victimId.toIntOrNull() ?: 1)
@@ -195,6 +221,16 @@ class MyExtension : BurpExtension {
                 }
             } catch (_: Exception) { } // Игнорируем ошибки парсинга
         }
+
+        // 5. Мутация HTTP-заголовков (Header-based IDOR / Access Control Bypass)
+        for (headerName in ScannerConfig.idorHeaders) {
+            for (victimId in ScannerConfig.victimIds) {
+                val mutationDesc = "Header: $headerName -> $victimId"
+                val mutatedReq = original.withAddedHeader(headerName, victimId)
+                mutations.add(mutationDesc to mutatedReq)
+            }
+        }
+
         return mutations
     }
 
@@ -228,10 +264,58 @@ class MyExtension : BurpExtension {
         return dp[len1][len2]
     }
 
-    // Проверка ответа на наличие утечек информации (Info Disclosure)
-    private fun checkResponseForLeaks(body: String): ResponseCheckResult {
+    // Очищает JSON-строку от известных динамических полей перед сравнением (снижает False Negatives)
+    private fun stripDynamicFields(jsonString: String): String {
+        return try {
+            val mapper = ObjectMapper()
+            val node = mapper.readTree(jsonString)
+            val dynamicKeys = listOf("timestamp", "time", "date", "csrf", "token", "nonce", "requestId")
+
+            fun removeKeys(n: com.fasterxml.jackson.databind.JsonNode) {
+                if (n.isObject) {
+                    val objectNode = n as ObjectNode
+                    val fieldNames = objectNode.fieldNames().asSequence().toList()
+                    for (fieldName in fieldNames) {
+                        if (dynamicKeys.any { fieldName.contains(it, ignoreCase = true) }) {
+                            objectNode.remove(fieldName)
+                        } else {
+                            removeKeys(objectNode.get(fieldName))
+                        }
+                    }
+                } else if (n.isArray) {
+                    n.forEach { removeKeys(it) }
+                }
+            }
+            removeKeys(node)
+            mapper.writeValueAsString(node)
+        } catch (_: Exception) {
+            jsonString // Если не JSON, возвращаем как есть
+        }
+    }
+
+    // Умная проверка ответа на наличие утечек информации (Info Disclosure)
+    private fun checkResponseForLeaks(body: String, statusCode: Int = 0): ResponseCheckResult {
         val lower = body.lowercase()
 
+        // Игнорируем стандартные 401/403 ответы, если они содержат типичный JSON с данными пользователя, а не стек-трейс
+        if (statusCode == 401 || statusCode == 403) {
+            try {
+                val json = ObjectMapper().readTree(body)
+                if (json.has("user") && (json.get("user").has("id") || json.get("user").has("email"))) {
+                    return ResponseCheckResult.ERROR_GENERIC
+                }
+                if (json.has("id") && json.has("email")) {
+                    return ResponseCheckResult.ERROR_GENERIC
+                }
+                if (json.has("error") && json.has("message")) {
+                    return ResponseCheckResult.ERROR_GENERIC
+                }
+            } catch (_: Exception) {
+                // Не JSON или ошибка парсинга - продолжаем проверку по ключевым словам
+            }
+        }
+
+        // Строгие паттерны утечек (стек-трейсы, SQL, пути, отладка)
         if (ScannerConfig.infoLeakKeywords.any { lower.contains(it) }) {
             return ResponseCheckResult.INFO_LEAK
         }
@@ -260,29 +344,46 @@ class MyExtension : BurpExtension {
 
             // 3. Baseline Check: если исходный запрос неуспешен (не 2xx), проверяем его на Info Disclosure, иначе пропускаем
             if (originalResponse.statusCode() !in 200..299) {
-                if (checkResponseForLeaks(originalResponse.bodyToString()) == ResponseCheckResult.INFO_LEAK) {
-                    api.logging().logToOutput("[!] НАЙДЕНА УТЕЧКА ИНФОРМАЦИИ (в исходном ответе): ${tracked.url}")
+                if (checkResponseForLeaks(originalResponse.bodyToString(), originalResponse.statusCode().toInt()) == ResponseCheckResult.INFO_LEAK) {
+                    if (loggedInfoLeaks.add(tracked.url)) {
+                        api.logging().logToOutput("[!] НАЙДЕНА УТЕЧКА ИНФОРМАЦИИ (в исходном ответе): ${tracked.url}")
+                    }
                     dashboard.addFinding(VulnerabilityFinding(
                         url = tracked.url,
                         type = "Info Disclosure",
                         severity = "Medium",
-                        details = "Исходный запрос вернул ошибку (${originalResponse.statusCode()}) с признаками утечки (stack trace, SQL error и т.д.)",
+                        details = "Исходный запрос вернул ошибку (${originalResponse.statusCode()}) с признаками утечки",
                         request = cleanOriginalRequest
                     ))
                 }
-                api.logging().logToOutput("[INFO] Пропуск анализа ${tracked.url}: исходный статус ${originalResponse.statusCode()} (требуется 2xx)")
+                api.logging().logToOutput("[INFO] Пропуск анализа ${tracked.url}: исходный статус ${originalResponse.statusCode()}")
                 return
             }
 
-            // 4. Генерируем и проверяем все возможные мутации
+            // 4. Генерируем мутации СРАЗУ, чтобы знать общее количество для прогресс-бара
+            val mutations = generateMutatedRequests(cleanOriginalRequest, tracked)
+            val totalMutations = mutations.size
+
+            // Обновляем UI: начинаем сканирование
+            dashboard.updateScanStatus(tracked.url, totalMutations, trackedRequests.size)
+
             val vulnerableMutations = mutableListOf<String>()
-            for ((mutationType, mutatedRequest) in generateMutatedRequests(cleanOriginalRequest, tracked)) {
+
+            // 5. Проверяем все возможные мутации с обновлением прогресса
+            for ((index, pair) in mutations.withIndex()) {
+                val (mutationType, mutatedRequest) = pair
+
+                // Обновляем прогресс-бар
+                dashboard.updateScanProgress(index + 1)
+
                 val mutatedResponse = sendRequest(api, mutatedRequest)
-                val checkResult = checkResponseForLeaks(mutatedResponse.bodyToString())
+                val checkResult = checkResponseForLeaks(mutatedResponse.bodyToString(), mutatedResponse.statusCode().toInt())
 
                 // СЦЕНАРИЙ А: Обнаружена утечка информации (Info Disclosure)
                 if (checkResult == ResponseCheckResult.INFO_LEAK) {
-                    api.logging().logToOutput("[!] НАЙДЕНА УТЕЧКА ИНФОРМАЦИИ (Info Disclosure): ${tracked.url}")
+                    if (loggedInfoLeaks.add(tracked.url)) {
+                        api.logging().logToOutput("[!] НАЙДЕНА УТЕЧКА ИНФОРМАЦИИ (Info Disclosure): ${tracked.url}")
+                    }
                     dashboard.addFinding(VulnerabilityFinding(
                         url = tracked.url,
                         type = "Info Disclosure",
@@ -293,15 +394,19 @@ class MyExtension : BurpExtension {
                 }
                 // СЦЕНАРИЙ Б: Ответ безопасен, проверяем на классический IDOR
                 else if (checkResult != ResponseCheckResult.ERROR_GENERIC) {
+                    // Очищаем ответы от динамических полей перед сравнением
+                    val cleanOriginalBody = stripDynamicFields(originalResponse.bodyToString())
+                    val cleanMutatedBody = stripDynamicFields(mutatedResponse.bodyToString())
+
                     if (originalResponse.statusCode() == mutatedResponse.statusCode() &&
-                        originalResponse.bodyToString().length == mutatedResponse.bodyToString().length &&
-                        levenshteinDistance(originalResponse.bodyToString(), mutatedResponse.bodyToString()) < 50) {
+                        cleanOriginalBody.length == cleanMutatedBody.length &&
+                        levenshteinDistance(cleanOriginalBody, cleanMutatedBody) < 50) {
                         vulnerableMutations.add(mutationType)
                     }
                 }
             }
 
-            // 5. Формирование вердикта и исключение известных публичных эндпоинтов (False Positives)
+            // 6. Формирование вердикта и исключение известных публичных эндпоинтов (False Positives)
             if (vulnerableMutations.isNotEmpty()) {
                 val isKnownPublic = ScannerConfig.publicEndpoints.any { endpoint ->
                     tracked.url.contains(endpoint, ignoreCase = true)
@@ -323,12 +428,18 @@ class MyExtension : BurpExtension {
                 }
             }
 
-            // 6. Триггер оркестрации: если в запросе есть параметры, запускаем параллельный скан Nuclei
+            // 7. Триггер оркестрации: если в запросе есть параметры, запускаем параллельный скан Nuclei
             if (tracked.queryParams.isNotEmpty() || tracked.jsonBodyFields.isNotEmpty() || tracked.method == "POST") {
                 thread(start = true, isDaemon = true) { runNucleiScan(api, cleanOriginalRequest) }
             }
+
         } catch (e: Exception) {
             api.logging().logToOutput("[!] Ошибка при анализе ${tracked.url}: ${e.message}")
+        } finally {
+            // Сообщаем Dashboard о завершении анализа этого URL для корректной работы прогресс-бара
+            // (Важно: используем размер сгенерированных мутаций, а не empty list)
+            val mutationsCount = generateMutatedRequests(tracked.originalRequest, tracked).size
+            dashboard.completeScanUrl(mutationsCount)
         }
     }
 
@@ -337,8 +448,11 @@ class MyExtension : BurpExtension {
             // Создание временного файла с Raw HTTP запросом
             val tempFile = File.createTempFile("autoscan_req_", ".txt").apply { writeText(request.toString()) }
 
-            // Настройка процесса: абсолютный путь к binary, вывод в JSON, таймаут
-            val processBuilder = ProcessBuilder(listOf("/home/kali/go/bin/nuclei", "-l", tempFile.absolutePath, "-json", "-timeout", "30")).apply { redirectErrorStream(true) }
+            // Настройка процесса: путь к binary (измените при необходимости), вывод в JSON, таймаут
+            // Примечание: если nuclei не в PATH, укажите полный путь, например: "/home/kali/go/bin/nuclei"
+            val processBuilder = ProcessBuilder(listOf("nuclei", "-l", tempFile.absolutePath, "-json", "-timeout", "30")).apply {
+                redirectErrorStream(true)
+            }
             api.logging().logToOutput("[NUCLEI] Запуск сканирования: ${request.url()}")
 
             val process = processBuilder.start()

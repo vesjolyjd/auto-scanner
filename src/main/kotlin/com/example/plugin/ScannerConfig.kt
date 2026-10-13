@@ -37,8 +37,9 @@ object ScannerConfig {
     // 4. ЖЕРТВЫ ДЛЯ IDOR (Значения для подмены идентификаторов)
     // =========================================================================
     val victimIds = mutableSetOf(
-        "1", "2", "3", "4", "5", "999", "0", "-1", "admin", "test",
-        "null", "00000000-0000-0000-0000-000000000000"
+        "1", "2", "999", "0", "-1",
+        "admin", "root", "me", "myself", "null", "undefined", "*",
+        "00000000-0000-0000-0000-000000000000"
     )
 
     // =========================================================================
@@ -47,9 +48,9 @@ object ScannerConfig {
     // Охватывает Java, PHP, Python, .NET и общие паттерны ошибок
     val infoLeakKeywords = mutableSetOf(
         // Общие
-        "exception", "fatal", "syntax error", "invalid query", "unexpected",
-        "stack", "trace", "traceback", "die(", "throw new", "assertion failed",
-        "debug", "error:", "failed to open stream", "undefined index", "undefined variable",
+        "exception", "fatal", "syntax error", "invalid query", "stacktrace", "stack trace",
+        "traceback", "die(", "throw new", "assertion failed", "debug",
+        "failed to open stream", "undefined index", "undefined variable",
         // Пути к файлам (Windows / Linux)
         "c:\\", "c:/", "/var/www/", "/usr/local/", "/home/", "appdata",
         // Специфичные для языков/фреймворков
@@ -77,6 +78,49 @@ object ScannerConfig {
         "/rest/user/whoami",
         // Общие паттерны публичных ресурсов
         "/public/", "/health", "/status", "/version", "/swagger", "/graphql",
-        "/robots.txt", "/sitemap.xml", "/assets/", "/static/", "/.well-known/", "/favicon.ico"
+        "/robots.txt", "/sitemap.xml", "/assets/", "/static/", "/.well-known/", "/favicon.ico",
+        // Игнорирование WebSocket и Socket.IO (источник 99% шума)
+        "/socket.io/",
+        "/websocket/",
+        "/ws/",
+        "eio=", // Ловит параметр ?EIO=4 в Socket.IO polling
+        "transport=polling"
+    )
+
+    // =========================================================================
+    // 8. ПАТТЕРНЫ ДЛЯ СЛОЖНЫХ ИДЕНТИФИКАТОРОВ
+    // =========================================================================
+    val uuidRegex = Regex("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+    val prefixedIdRegex = Regex("([a-zA-Z_]+)[-_](\\d+)") // Например: user_123, order-456
+
+    // =========================================================================
+    // 9. ЗАГОЛОВКИ ДЛЯ МУТАЦИИ (Header-based IDOR)
+    // =========================================================================
+    val idorHeaders = listOf(
+        // Идентификация пользователя
+        "X-User-Id",
+        "X-UserID",
+        "X-UUID",
+        "X-Forwarded-User",
+        "X-Authenticated-User",
+        "X-Profile-Id",
+
+        // Перезапись URL и маршрутов
+        "X-Original-URL",
+        "X-Rewrite-URL",
+        "X-Forwarded-URL",
+
+        // Подмена IP-адресов
+        "X-Forwarded-For",
+        "X-Real-IP",
+        "X-Custom-IP-Authorization",
+        "X-Client-IP",
+        "True-Client-IP",
+        "X-Originating-IP",
+
+        // Изменение методов
+        "X-HTTP-Method-Override",
+        "X-HTTP-Method",
+        "X-Method-Override"
     )
 }

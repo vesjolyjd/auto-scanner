@@ -25,18 +25,39 @@ class FindingsTableModel(val findings: MutableList<VulnerabilityFinding>) : Abst
     override fun getRowCount(): Int = findings.size
     override fun getColumnCount(): Int = columns.size
     override fun getColumnName(column: Int): String = columns[column]
-    override fun getColumnClass(columnIndex: Int): Class<*> = when (columnIndex) { 0 -> java.lang.Integer::class.java else -> String::class.java }
+    override fun getColumnClass(columnIndex: Int): Class<*> = when (columnIndex) {
+        0 -> java.lang.Integer::class.java
+        else -> String::class.java
+    }
 
     override fun getValueAt(rowIndex: Int, columnIndex: Int): Any {
         val f = findings[rowIndex]
         val time = SimpleDateFormat("HH:mm:ss").format(Date(f.timestamp))
         return when (columnIndex) {
-            0 -> rowIndex + 1; 1 -> f.type; 2 -> f.severity; 3 -> f.url; 4 -> f.details; 5 -> time; else -> ""
+            0 -> rowIndex + 1
+            1 -> f.type
+            2 -> f.severity
+            3 -> f.url
+            4 -> f.details
+            5 -> time
+            else -> ""
         }
     }
 
-    fun removeFinding(index: Int) { if (index in findings.indices) { findings.removeAt(index); fireTableRowsDeleted(index, index) } }
-    fun clearAll() { val size = findings.size; if (size > 0) { findings.clear(); fireTableRowsDeleted(0, size - 1) } }
+    fun removeFinding(index: Int) {
+        if (index in findings.indices) {
+            findings.removeAt(index)
+            fireTableRowsDeleted(index, index)
+        }
+    }
+
+    fun clearAll() {
+        val size = findings.size
+        if (size > 0) {
+            findings.clear()
+            fireTableRowsDeleted(0, size - 1)
+        }
+    }
 }
 
 // Рендерер для раскраски текста уровня критичности (Severity) + фон строки
@@ -167,6 +188,16 @@ class AutoScannerDashboardPanel(private val api: MontoyaApi) : JPanel() {
     private val findingsList = java.util.concurrent.CopyOnWriteArrayList<VulnerabilityFinding>()
     private val tableModel = FindingsTableModel(findingsList)
 
+    // Поля для панели статуса (должны быть доступны всем методам класса)
+    private lateinit var statusLabel: JLabel
+    private lateinit var progressBar: JProgressBar
+    private lateinit var queueLabel: JLabel
+
+    // Счетчики для агрегированного прогресса
+    private var totalMutationsAll = 0
+    private var completedMutationsAll = 0
+    private var activeUrls = 0
+
     // Инициализация и настройка внешнего вида JTable
     private val table = JTable(tableModel).apply {
         autoResizeMode = JTable.AUTO_RESIZE_LAST_COLUMN
@@ -181,7 +212,7 @@ class AutoScannerDashboardPanel(private val api: MontoyaApi) : JPanel() {
         // Применяем рендереры ко всем колонкам
         for (i in 0 until columnCount) {
             if (i == 4) {
-                // Для Details используем рендерер с JTextArea
+                // Для Details используем умный рендерер с JTextArea
                 getColumnModel().getColumn(i).cellRenderer = DetailsCellRenderer(this)
             } else if (i == 2) {
                 // Для Severity используем комбинированный рендерер (фон + цвет текста)
@@ -196,7 +227,7 @@ class AutoScannerDashboardPanel(private val api: MontoyaApi) : JPanel() {
         getColumnModel().getColumn(0).apply { preferredWidth = 40; maxWidth = 50 }
         getColumnModel().getColumn(1).apply { preferredWidth = 130; maxWidth = 150 }
         getColumnModel().getColumn(2).apply { preferredWidth = 80; maxWidth = 100 }
-        getColumnModel().getColumn(4).preferredWidth = 350
+        getColumnModel().getColumn(4).preferredWidth = 500
         getColumnModel().getColumn(5).apply { preferredWidth = 80; maxWidth = 100 }
     }
 
@@ -215,7 +246,9 @@ class AutoScannerDashboardPanel(private val api: MontoyaApi) : JPanel() {
     private val lowCountLabel = JLabel("Low: 0")
 
     init {
+        // =========================================================================
         // Динамическое изменение размера колонки Details при двойном клике на заголовок
+        // =========================================================================
         table.tableHeader.addMouseListener(object : java.awt.event.MouseAdapter() {
             override fun mouseClicked(e: java.awt.event.MouseEvent) {
                 if (e.clickCount == 2) {
@@ -241,7 +274,9 @@ class AutoScannerDashboardPanel(private val api: MontoyaApi) : JPanel() {
 
         layout = BorderLayout()
 
+        // =========================================================================
         // 1. Верхняя панель инструментов (Toolbar)
+        // =========================================================================
         val toolBar = JToolBar().apply { isFloatable = false; border = BorderFactory.createEmptyBorder(5, 5, 5, 5) }
         searchField.toolTipText = "Поиск по URL или деталям"; searchField.columns = 20
         toolBar.add(JLabel("  Search: ")); toolBar.add(searchField); toolBar.add(Box.createHorizontalStrut(10))
@@ -263,10 +298,50 @@ class AutoScannerDashboardPanel(private val api: MontoyaApi) : JPanel() {
 
         add(toolBar, BorderLayout.NORTH)
 
-        // 2. Центральная область с таблицей
-        add(JScrollPane(table).apply { border = BorderFactory.createEmptyBorder() }, BorderLayout.CENTER)
+        // =========================================================================
+        // 2. Панель статуса и прогресса сканирования
+        // =========================================================================
+        val statusPanel = JPanel(BorderLayout(5, 5)).apply {
+            border = BorderFactory.createCompoundBorder(
+                BorderFactory.createMatteBorder(0, 0, 1, 0, Color(200, 200, 200)),
+                BorderFactory.createEmptyBorder(5, 10, 5, 10)
+            )
+            background = Color(245, 245, 245)
+        }
 
-        // 3. Нижняя панель (Статистика + Кнопки действий)
+        // Инициализируем поля класса (без val!)
+        statusLabel = JLabel("🟢 Статус: Ожидание трафика...").apply {
+            font = Font("SansSerif", Font.BOLD, 12)
+            foreground = Color(50, 50, 50)
+        }
+
+        progressBar = JProgressBar(0, 100).apply {
+            isStringPainted = true
+            string = "Ожидание..."
+            preferredSize = Dimension(300, 20)
+        }
+
+        queueLabel = JLabel("В очереди: 0").apply {
+            font = Font("SansSerif", Font.PLAIN, 11)
+            foreground = Color(100, 100, 100)
+            horizontalAlignment = SwingConstants.RIGHT
+        }
+
+        statusPanel.add(statusLabel, BorderLayout.WEST)
+        statusPanel.add(progressBar, BorderLayout.CENTER)
+        statusPanel.add(queueLabel, BorderLayout.EAST)
+
+        // =========================================================================
+        // 3. Центральная область с таблицей
+        // =========================================================================
+        val centerPanel = JPanel(BorderLayout())
+        centerPanel.add(statusPanel, BorderLayout.NORTH)
+        centerPanel.add(JScrollPane(table).apply { border = BorderFactory.createEmptyBorder() }, BorderLayout.CENTER)
+        add(centerPanel, BorderLayout.CENTER)
+
+        // =========================================================================
+        // 4. Нижняя панель (Статистика + Кнопки действий)
+        // =========================================================================
         val bottomPanel = JPanel(BorderLayout()).apply { border = BorderFactory.createEmptyBorder(5, 5, 5, 5) }
         val statsPanel = JPanel(FlowLayout(FlowLayout.LEFT, 10, 0)).apply {
             totalCountLabel.font = Font("SansSerif", Font.BOLD, 12)
@@ -285,7 +360,9 @@ class AutoScannerDashboardPanel(private val api: MontoyaApi) : JPanel() {
         bottomPanel.add(buttonsPanel, BorderLayout.EAST)
         add(bottomPanel, BorderLayout.SOUTH)
 
-        // 4. Обработчики событий (Реактивность UI)
+        // =========================================================================
+        // 5. Обработчики событий (Реактивность UI)
+        // =========================================================================
         searchField.document.addDocumentListener(object : javax.swing.event.DocumentListener {
             override fun insertUpdate(e: javax.swing.event.DocumentEvent?) = applyFilters()
             override fun removeUpdate(e: javax.swing.event.DocumentEvent?) = applyFilters()
@@ -339,6 +416,90 @@ class AutoScannerDashboardPanel(private val api: MontoyaApi) : JPanel() {
     }
 
     // =========================================================================
+    // МЕТОДЫ ДЛЯ ОБНОВЛЕНИЯ СТАТУСА (потокобезопасные с защитой от переполнения)
+    // =========================================================================
+
+    fun updateScanStatus(url: String, totalMutations: Int, currentQueueSize: Int) {
+        SwingUtilities.invokeLater {
+            activeUrls++
+            totalMutationsAll += totalMutations
+
+            if (activeUrls == 1) {
+                // Первый URL — показываем конкретный
+                statusLabel.text = "🔍 Анализ: ${url.take(50)}${if (url.length > 50) "..." else ""}"
+                progressBar.isIndeterminate = false
+                progressBar.maximum = totalMutationsAll
+                progressBar.value = 0
+                progressBar.string = "0 / $totalMutationsAll"
+            } else {
+                // Несколько URL — показываем агрегированный
+                statusLabel.text = "🔍 Анализируется $activeUrls URL..."
+                progressBar.maximum = totalMutationsAll
+                // ЖЕСТКАЯ ЗАЩИТА: значение никогда не превысит maximum
+                progressBar.value = minOf(completedMutationsAll, totalMutationsAll)
+                progressBar.string = "${progressBar.value} / $totalMutationsAll"
+            }
+
+            queueLabel.text = "В очереди: $currentQueueSize"
+        }
+    }
+
+    fun updateScanProgress(completedMutations: Int) {
+        SwingUtilities.invokeLater {
+            // ЖЕСТКАЯ ЗАЩИТА: гарантируем, что значение не превысит maximum
+            val newValue = minOf(completedMutationsAll + completedMutations, totalMutationsAll)
+            progressBar.value = newValue
+            progressBar.string = "$newValue / $totalMutationsAll"
+        }
+    }
+
+    fun completeScanUrl(completedMutations: Int) {
+        SwingUtilities.invokeLater {
+            activeUrls--
+            completedMutationsAll += completedMutations
+
+            // ЖЕСТКАЯ ЗАЩИТА: предотвращаем отрицательные значения и переполнение из-за гонки потоков
+            activeUrls = maxOf(0, activeUrls)
+            completedMutationsAll = minOf(completedMutationsAll, totalMutationsAll)
+
+            if (activeUrls == 0) {
+                // Все завершены
+                statusLabel.text = "✅ Готово"
+                progressBar.isIndeterminate = false
+                progressBar.value = progressBar.maximum
+                progressBar.string = "Завершено"
+
+                // Сброс счетчиков только после полной остановки
+                totalMutationsAll = 0
+                completedMutationsAll = 0
+            } else {
+                // Ещё есть активные, обновляем строку
+                progressBar.string = "$completedMutationsAll / $totalMutationsAll"
+            }
+        }
+    }
+
+    fun clearScanStatus() {
+        SwingUtilities.invokeLater {
+            statusLabel.text = "🟢 Статус: Ожидание трафика..."
+            progressBar.value = 0
+            progressBar.string = "Ожидание..."
+            progressBar.isIndeterminate = false
+
+            // Полный сброс счетчиков
+            totalMutationsAll = 0
+            completedMutationsAll = 0
+            activeUrls = 0
+        }
+    }
+
+    fun updateQueueSize(size: Int) {
+        SwingUtilities.invokeLater {
+            queueLabel.text = "В очереди: $size"
+        }
+    }
+
+    // =========================================================================
     // ЛОГИКА ДЕЙСТВИЙ И ФИЛЬТРАЦИИ
     // =========================================================================
 
@@ -359,7 +520,10 @@ class AutoScannerDashboardPanel(private val api: MontoyaApi) : JPanel() {
     // Отправка выбранного запроса в Burp Repeater
     private fun openSelectedInRepeater() {
         val selectedRow = table.selectedRow
-        if (selectedRow == -1) { JOptionPane.showMessageDialog(this, "Сначала выберите уязвимость.", "Информация", JOptionPane.INFORMATION_MESSAGE); return }
+        if (selectedRow == -1) {
+            JOptionPane.showMessageDialog(this, "Сначала выберите уязвимость.", "Информация", JOptionPane.INFORMATION_MESSAGE)
+            return
+        }
         val finding = findingsList[table.convertRowIndexToModel(selectedRow)]
         try {
             api.repeater().sendToRepeater(finding.request, "AutoScanner Finding")
@@ -399,7 +563,10 @@ class AutoScannerDashboardPanel(private val api: MontoyaApi) : JPanel() {
 
     // Экспорт всех находок в форматированный JSON-файл
     private fun exportToJson() {
-        if (findingsList.isEmpty()) { JOptionPane.showMessageDialog(this, "Нет данных.", "Информация", JOptionPane.INFORMATION_MESSAGE); return }
+        if (findingsList.isEmpty()) {
+            JOptionPane.showMessageDialog(this, "Нет данных.", "Информация", JOptionPane.INFORMATION_MESSAGE)
+            return
+        }
         val chooser = JFileChooser().apply { dialogTitle = "Экспорт"; selectedFile = File("autoscan_findings_${System.currentTimeMillis()}.json") }
         if (chooser.showSaveDialog(this) == JFileChooser.APPROVE_OPTION) {
             try {
@@ -426,8 +593,13 @@ class AutoScannerDashboardPanel(private val api: MontoyaApi) : JPanel() {
     // Публичный метод для добавления новой находки из фонового потока (безопасно для Swing через invokeLater)
     fun addFinding(newFinding: VulnerabilityFinding) {
         SwingUtilities.invokeLater {
-            // Ищем, есть ли уже такая находка по URL и типу
-            val existingIndex = findingsList.indexOfFirst { it.url == newFinding.url && it.type == newFinding.type }
+            // Нормализуем URL, убирая query-параметры для лучшего поиска дубликатов
+            val baseUrl = newFinding.url.substringBefore("?")
+
+            // Ищем находку по базовому URL и типу
+            val existingIndex = findingsList.indexOfFirst {
+                it.url.substringBefore("?") == baseUrl && it.type == newFinding.type
+            }
 
             if (existingIndex != -1) {
                 // Если есть, объединяем детали (чтобы не плодить дубликаты в таблице)
@@ -442,7 +614,7 @@ class AutoScannerDashboardPanel(private val api: MontoyaApi) : JPanel() {
                 findingsList[existingIndex] = mergedFinding
                 tableModel.fireTableRowsUpdated(existingIndex, existingIndex)
             } else {
-                // Если нет, добавляем новую
+                // Если нет, добавляем новую запись
                 findingsList.add(newFinding)
                 tableModel.fireTableRowsInserted(findingsList.size - 1, findingsList.size - 1)
             }
