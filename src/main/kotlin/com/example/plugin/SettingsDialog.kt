@@ -3,7 +3,7 @@ package com.example.plugin
 import java.awt.*
 import javax.swing.*
 
-class SettingsDialog(parent: Frame?) : JDialog(parent as Frame?, "Настройки эвристик сканера", true) {
+class SettingsDialog(parent: Frame?) : JDialog(parent, "Настройки эвристик сканера", true) {
 
     init {
         size = Dimension(600, 500)
@@ -42,6 +42,32 @@ class SettingsDialog(parent: Frame?) : JDialog(parent as Frame?, "Настрой
         tabbedPane.addTab("Безопасные ошибки", createConfigTab("Ошибки, которые игнорируются (False Positive)", ScannerConfig.genericErrors))
         tabbedPane.addTab("Публичные эндпоинты", createConfigTab("URL-адреса, которые не проверяются на IDOR", ScannerConfig.publicEndpoints))
 
+        // Секция внешних инструментов: путь к бинарнику и режим подробного аудита
+        val externalToolsPanel = JPanel(BorderLayout()).apply {
+            val form = JPanel(GridBagLayout()).apply {
+                val gbc = GridBagConstraints().apply {
+                    insets = Insets(5, 5, 5, 5)
+                    anchor = GridBagConstraints.WEST
+                    fill = GridBagConstraints.HORIZONTAL
+                }
+
+                val nucleiPathField = JTextField(ScannerConfig.nucleiExecutablePath, 30)
+                gbc.gridx = 0; gbc.gridy = 0; gbc.weightx = 0.0
+                add(JLabel("Путь к Nuclei:"), gbc)
+                gbc.gridx = 1; gbc.weightx = 1.0
+                add(nucleiPathField, gbc)
+
+                val verboseExportCheck = JCheckBox("Подробный аудит (full_audit_log.json)", ScannerConfig.verboseExport)
+                gbc.gridx = 1; gbc.gridy = 1; gbc.weightx = 1.0
+                add(verboseExportCheck, gbc)
+
+                putClientProperty("nucleiPathField", nucleiPathField)
+                putClientProperty("verboseExportCheck", verboseExportCheck)
+            }
+            add(form, BorderLayout.NORTH)
+        }
+        tabbedPane.addTab("Внешние инструменты", externalToolsPanel)
+
         add(tabbedPane, BorderLayout.CENTER)
 
         // Кнопки управления
@@ -52,7 +78,9 @@ class SettingsDialog(parent: Frame?) : JDialog(parent as Frame?, "Настрой
                 // Проходим по всем вкладкам и обновляем конфигурацию
                 for (i in 0 until tabbedPane.tabCount) {
                     val panel = tabbedPane.getComponentAt(i) as JPanel
-                    val textArea = panel.getClientProperty("textArea") as JTextArea
+                    val textArea = panel.getClientProperty("textArea") as? JTextArea ?: continue
+                    // Подавление unchecked-каста: значение кладётся сюда только из createConfigTab
+                    @Suppress("UNCHECKED_CAST")
                     val configSet = panel.getClientProperty("configSet") as MutableSet<String>
 
                     configSet.clear()
@@ -62,6 +90,16 @@ class SettingsDialog(parent: Frame?) : JDialog(parent as Frame?, "Настрой
                             .filter { it.isNotEmpty() }
                     )
                 }
+                // Чтение полей секции внешних инструментов
+                val toolsPanel = tabbedPane.getComponentAt(tabbedPane.tabCount - 1) as JPanel
+                (toolsPanel.getClientProperty("nucleiPathField") as? JTextField)?.let {
+                    ScannerConfig.nucleiExecutablePath = it.text.trim()
+                }
+                (toolsPanel.getClientProperty("verboseExportCheck") as? JCheckBox)?.let {
+                    ScannerConfig.verboseExport = it.isSelected
+                }
+                // Сброс fail-fast флага: после изменения настроек пользователю даётся шанс повторной проверки пути без перезагрузки Burp
+                MyExtension.currentInstance?.resetExternalToolsState()
                 JOptionPane.showMessageDialog(this, "Настройки успешно сохранены!\nНовые правила применятся к следующим запросам.", "Успех", JOptionPane.INFORMATION_MESSAGE)
                 dispose()
             }

@@ -9,7 +9,11 @@ import burp.api.montoya.http.message.responses.HttpResponse
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.databind.node.ObjectNode
 import java.io.File
+import java.io.IOException
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 
 // Результат проверки ответа сервера на наличие утечек
@@ -19,7 +23,63 @@ enum class ResponseCheckResult {
     INFO_LEAK       // Ошибка с утечкой данных (Stack trace, SQL error, внутренние пути)
 }
 
+// =========================================================================
+// УРОВНИ ВЕРДИКТА IDOR: иерархия результатов анализа мутаций
+// sealed class гарантирует исчерпывающий match при обработке результата
+// =========================================================================
+sealed class IdorVerdict(val severity: String, val label: String) {
+    object CriticalModification : IdorVerdict("Critical", "CRITICAL: Data Modification")
+    object HighExposure : IdorVerdict("High", "HIGH: Data Exposure")
+    object MediumPotential : IdorVerdict("Medium", "MEDIUM: Potential Exposure")
+    object SafeDenied : IdorVerdict("Info", "SAFE: Access Denied")
+    object FalsePositive : IdorVerdict("Low", "LOW: False Positive / No Impact")
+}
+
+// Результат анализа одной мутации: вердикт + метрики для detailsMessage
+data class IdorAnalysisResult(
+    val verdict: IdorVerdict,
+    val statusCode: Int,
+    val containsVictimId: Boolean,
+    val containsSensitiveData: Boolean,
+    val similarityPercentage: Double, // Процент РАЗЛИЧИЯ тел ответов (0.0 == идентичны)
+    val detailsMessage: String        // Готовый многострочный текст для колонки Details
+) {
+    companion object {
+        // Порог семантической идентичности: различие ответов не выше 1% трактуется как "ответы совпадают"
+        const val IDENTICAL_SIMILARITY_THRESHOLD_PERCENT = 99.0
+    }
+
+    // Признак того, что baseline и мутированный ответ практически не различаются
+    val isResponseIdentical: Boolean get() = similarityPercentage <= 100.0 - IDENTICAL_SIMILARITY_THRESHOLD_PERCENT
+}
+
 class MyExtension : BurpExtension {
+
+    // Fail-fast флаг: ошибка запуска внешнего инструмента выводится однократно за сессию,
+    // чтобы отсутствие бинарника в PATH не генерировало дубликаты на каждый запрос.
+    // Сбрасывается при сохранении настроек — пользователю даётся шанс проверить исправление пути без перезагрузки Burp
+    @Volatile
+    private var nucleiUnavailableLogged = false
+
+    // Повторная инициализация оркестрации после изменения пути к внешнему инструменту
+    fun resetExternalToolsState() {
+        nucleiUnavailableLogged = false
+    }
+
+    // Снимок полного аудита для экспорта: копирует потокобезопасный буфер в обычный список для сериализации Jackson
+    fun auditSnapshot(): List<AuditStep> = auditLog.toList()
+
+    companion object {
+        // Порог значимого различия тел ответов: > 15% правок Левенштейна = ответ изменён
+        const val DIFF_THRESHOLD_PERCENT = 15.0
+
+        // Геттер активного экземпляра: позволяет диалогу настроек сбросить fail-fast флаг без передачи ссылки через конструктор
+        val currentInstance: MyExtension? get() = INSTANCE
+
+        @Volatile
+        private var INSTANCE: MyExtension? = null
+    }
+
     // Потокобезопасный список для хранения уникальных перехваченных запросов
     private val trackedRequests = CopyOnWriteArrayList<TrackedRequest>()
     private lateinit var dashboard: AutoScannerDashboardPanel
@@ -27,7 +87,21 @@ class MyExtension : BurpExtension {
     // Множество для предотвращения спама одинаковых сообщений об утечках в консоль
     private val loggedInfoLeaks = mutableSetOf<String>()
 
+    // Полные тексты всех успешных векторов по URL находки.
+    // Хранятся вне UI-модели, чтобы не раздувать таблицу; используются только при подробном экспорте.
+    private val allVectorsByFinding = ConcurrentHashMap<String, List<String>>()
+
+    // Буфер полного аудита: каждая проверенная мутация (включая отклонённые вердикты).
+    // Потокобезопасная коллекция: фоновые потоки сканера пишут в буфер параллельно с чтением при экспорте.
+    private val auditLog = CopyOnWriteArrayList<AuditStep>()
+
+    // Активные скан-сессии (URL -> latch) для корректного определения момента полного завершения
+    private val activeSessions = ConcurrentHashMap<String, CountDownLatch>()
+
     override fun initialize(api: MontoyaApi) {
+        // Регистрация экземпляра для обратных вызовов из UI (например, сброс fail-fast флага после сохранения настроек)
+        INSTANCE = this
+
         // Инициализация имени плагина и приветственных логов
         api.extension().setName("Burp AutoScanner Pro")
         api.logging().logToOutput("========================================")
@@ -38,6 +112,10 @@ class MyExtension : BurpExtension {
         // Регистрация кастомной вкладки графического интерфейса
         dashboard = AutoScannerDashboardPanel(api)
         api.userInterface().registerSuiteTab("AutoScanner Dashboard", dashboard)
+
+        // Монитор завершения сканирования: фоновый поток дожидается окончания всех активных сессий
+        // и только затем переводит статус-бар в состояние "Завершено" (см. awaitAllScansAndFinalize)
+        thread(start = true, isDaemon = true) { awaitAllScansAndFinalize(api) }
 
         // Регистрация обработчика HTTP-трафика
         api.http().registerHttpHandler(object : HttpHandler {
@@ -80,10 +158,19 @@ class MyExtension : BurpExtension {
                                 dashboard.updateQueueSize(trackedRequests.size)
 
                                 // Асинхронный запуск анализа в фоновом потоке (Daemon), чтобы не блокировать UI Burp
+                                // Сессия регистрируется до старта потока, чтобы финальный мониторинг
+                                // не увидел ноль активных сессий между созданием потока и его запуском
+                                val latch = CountDownLatch(1)
+                                activeSessions[tracked.url] = latch
                                 thread(start = true, isDaemon = true) {
-                                    testIdorAdvanced(api, tracked)
-                                    // Уменьшаем счетчик очереди после завершения анализа
-                                    dashboard.updateQueueSize(trackedRequests.size - 1)
+                                    try {
+                                        testIdorAdvanced(api, tracked)
+                                    } finally {
+                                        // Уменьшаем счетчик очереди после завершения анализа
+                                        dashboard.updateQueueSize(trackedRequests.size - 1)
+                                        latch.countDown()
+                                        activeSessions.remove(tracked.url)
+                                    }
                                 }
                             }
                         }
@@ -96,6 +183,36 @@ class MyExtension : BurpExtension {
             override fun handleHttpResponseReceived(responseReceived: HttpResponseReceived): ResponseReceivedAction =
                 ResponseReceivedAction.continueWith(responseReceived)
         })
+    }
+
+    // =========================================================================
+    // СИНХРОНИЗАЦИЯ СОСТОЯНИЯ UI: финализация статуса после завершения всех потоков сканирования
+    // Текст "Завершено" выставляется только когда счётчик активных сессий достигает нуля,
+    // что исключает преждевременное появление статуса между запуском и окончанием фоновых задач.
+    // =========================================================================
+    private fun awaitAllScansAndFinalize(api: MontoyaApi) {
+        try {
+            var idleRounds = 0 // Счётчик пустых проверок подряд: защита от "мёртвого" ожидания при старте
+            while (true) {
+                val pending = activeSessions.values.toList()
+                if (pending.isEmpty()) {
+                    if (trackedRequests.isNotEmpty() && ++idleRounds >= 2) {
+                        // Все известные сессии завершены, новых перехватов нет: фиксируем итог в UI-потоке
+                        dashboard.finalizeScanStatus(trackedRequests.size)
+                        return
+                    }
+                    Thread.sleep(200)
+                    continue
+                }
+                idleRounds = 0
+                // Ожидаем окончания текущих сессий; новый URL может появиться во время ожидания —
+                // тогда цикл повторяет проверку и ждёт уже расширенный набор latch-ей
+                pending.forEach { it.await(500, TimeUnit.MILLISECONDS) }
+            }
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            api.logging().logToOutput("[!] Монитор завершения сканирования прерван")
+        }
     }
 
     // =========================================================================
@@ -328,6 +445,275 @@ class MyExtension : BurpExtension {
     }
 
     // =========================================================================
+    // АНАЛИЗАТОР ВЕРДИКТА IDOR: многошаговая классификация ответа на мутацию
+    // Чистая функция: не трогает UI и сеть, потокобезопасна по своим данным.
+    // Читает config только через локальные val-копии (Set может редактироваться
+    // из SettingsDialog в UI-потоке -> снижаем риск ConcurrentModification).
+    // =========================================================================
+    fun analyzeIdorResponse(
+        originalMethod: String,
+        victimId: String,
+        baselineResponse: HttpResponse,
+        mutatedResponse: HttpResponse,
+        config: ScannerConfig
+    ): IdorAnalysisResult {
+        val status: Int = mutatedResponse.statusCode().toInt()
+        val mutatedBody = mutatedResponse.bodyToString()
+        val method = originalMethod.uppercase()
+        val genericErrors = config.genericErrors.toList()   // snapshot вместо итерации по MutableSet
+        val sensitiveFields = config.sensitiveFields.toList()
+
+        // Формирование информативного detailsMessage для колонки Details
+        fun buildDetails(
+            verdict: IdorVerdict,
+            diffPct: Double = 0.0,
+            victimReflected: Boolean = false,
+            sensitiveFound: Boolean = false,
+            explanation: String
+        ) = """
+            [${verdict.label}]
+            Status Code: $status
+            Method: $method
+            Response Diff: ${"%.1f".format(diffPct)}%
+            Victim ID Reflected: $victimReflected
+            Sensitive Data Found: $sensitiveFound
+            $explanation
+        """.trimIndent()
+
+        fun result(verdict: IdorVerdict, victim: Boolean = false, sensitive: Boolean = false,
+                   diff: Double = 0.0, explanation: String) =
+            IdorAnalysisResult(verdict, status, victim, sensitive, diff,
+                buildDetails(verdict, diff, victim, sensitive, explanation))
+
+        // --- Шаг 1: доступ запрещён на уровне HTTP-статуса ---
+        if (status in setOf(401, 403, 404)) {
+            return result(IdorVerdict.SafeDenied,
+                explanation = "Сервер корректно отклонил мутированный запрос (HTTP $status). Контроль доступа работает.")
+        }
+
+        // Кэш diff-а для state-changing методов: считаем один раз при необходимости
+        fun responseDiffPercent(): Double {
+            val baseline = stripDynamicFields(baselineResponse.bodyToString())
+            val mutated = stripDynamicFields(mutatedBody)
+            val distance = levenshteinDistance(baseline, mutated)
+            return 100.0 - (distance.toDouble() / maxOf(baseline.length, mutated.length, 1) * 100.0)
+        }
+
+        // --- Шаг 2: запись данных чужим объектом (State-Changing методы + 2xx) ---
+        if (method in setOf("POST", "PUT", "PATCH", "DELETE") && status in 200..299) {
+            val lower = mutatedBody.lowercase()
+            val hasGenericError = genericErrors.any { lower.contains(it) }
+            if (!hasGenericError) {
+                val diff = responseDiffPercent()
+                val identical = diff <= 100.0 - IdorAnalysisResult.IDENTICAL_SIMILARITY_THRESHOLD_PERCENT
+                val explanation = if (identical) {
+                    // Успешный 2xx на модификацию — сам факт отсутствия отказа уже является доказательством
+                    // BOLA; идентичность тела не отменяет вердикт
+                    "Операция изменения/удаления выполнена успешно (статус $status). " +
+                            "Отсутствие ошибок указывает на отсутствие контроля доступа (BOLA)."
+                } else {
+                    "$method вернул $status без признаков отказа: операция изменения данных " +
+                            "над чужим объектом (victim_id='$victimId') выполнена. Вероятна Horizontal/Vertical Privilege Escalation."
+                }
+                return result(IdorVerdict.CriticalModification, diff = diff, explanation = explanation)
+            }
+            return result(IdorVerdict.SafeDenied,
+                explanation = "$method отклонён на уровне тела ответа (generic error). Запись не произведена.")
+        }
+
+        // --- Шаг 3: чтение данных (GET + 2xx) ---
+        if (method == "GET" && status in 200..299) {
+            // 3а: отказ, «зашитый» в тело 200-го ответа
+            val lower = mutatedBody.lowercase()
+            if (genericErrors.any { lower.contains(it) }) {
+                return result(IdorVerdict.SafeDenied,
+                    explanation = "HTTP $status, но тело содержит признак отказа (generic error). Доступ к данным не получен.")
+            }
+
+            // 3б: рефлексия идентификатора жертвы в ответе
+            val containsVictimId = mutatedBody.contains(victimId)
+
+            // 3в: любые ключи/значения чувствительных полей в теле ответа
+            val containsSensitiveData = sensitiveFields.any { field ->
+                mutatedBody.contains(field, ignoreCase = true)
+            }
+
+            // 3г: сравнение ответов после очистки динамических полей (metric-safe Levenshtein)
+            val baseline = stripDynamicFields(baselineResponse.bodyToString())
+            val mutated = stripDynamicFields(mutatedBody)
+            val distance = levenshteinDistance(baseline, mutated)
+            val diffPercentage = 100.0 - (distance.toDouble() / maxOf(baseline.length, mutated.length, 1) * 100.0)
+
+            val hasEvidence = containsVictimId || containsSensitiveData
+            val isDifferent = diffPercentage > DIFF_THRESHOLD_PERCENT
+            val identical = diffPercentage <= 100.0 - IdorAnalysisResult.IDENTICAL_SIMILARITY_THRESHOLD_PERCENT
+
+            return when {
+                // 3д: есть доказательства утечки И ответы существенно различаются
+                hasEvidence && isDifferent -> result(
+                    IdorVerdict.HighExposure, containsVictimId, containsSensitiveData, diffPercentage,
+                    explanation = if (identical) {
+                        // Ответы семантически идентичны: совпадение ID/полей в одинаковых шаблонах
+                        // не доказывает чтение чужих данных — исключаем ложные утверждения
+                        "Ответы семантически идентичны (Diff: ${"%.1f".format(diffPercentage)}%). " +
+                                "Возможный False Positive или публичный ресурс."
+                    } else {
+                        // Формулировка согласована с метрикой: указывается именно процент РАЗЛИЧИЯ ответов
+                        "Ответ на мутированный запрос отличается от baseline на ${"%.1f".format(diffPercentage)}% " +
+                                "и содержит " + listOfNotNull(
+                            if (containsVictimId) "ID жертвы ('$victimId')" else null,
+                            if (containsSensitiveData) "чувствительные поля" else null
+                        ).joinToString(" и ") + ". Чужие данные прочитаны."
+                    }
+                )
+                // 3е: прямых доказательств нет, но содержимое изменилось — косвенный признак
+                !hasEvidence && isDifferent -> result(
+                    IdorVerdict.MediumPotential, false, false, diffPercentage,
+                    explanation = "Прямых маркеров (victim id / sensitive fields) не найдено, но тело ответа " +
+                            "существенно отличается от baseline (Различие ответов: ${"%.1f".format(diffPercentage)}%, " +
+                            "${distance} правок Левенштейна). Требуется ручная проверка в Repeater."
+                )
+                // 3ж: ответы почти идентичны — мутация проигнорирована сервером
+                else -> result(
+                    IdorVerdict.FalsePositive, containsVictimId, containsSensitiveData, diffPercentage,
+                    explanation = if (identical) {
+                        // Идентичные ответы: утверждения об утечке чужих данных исключены
+                        "Ответы семантически идентичны (Diff: ${"%.1f".format(diffPercentage)}%). " +
+                                "Возможный False Positive или публичный ресурс."
+                    } else {
+                        "Различие ответов <= ${Companion.DIFF_THRESHOLD_PERCENT}%: сервер вернул тот же контент, что и baseline. " +
+                                "Параметр/заголовок '$victimId' на обработку не влияет."
+                    }
+                )
+            }
+        }
+
+        // --- Фолбэк: нестандартная комбинация метода/статуса ---
+        return result(IdorVerdict.FalsePositive,
+            explanation = "Комбинация '$method / HTTP $status' не попадает ни под один сценарий эксплуатации. Анализ пропущен.")
+    }
+
+    // =========================================================================
+    // АГРЕГАЦИЯ ОТЧЁТА: компактный структурированный details без "простыни" векторов
+    // Positive verdict = CriticalModification / HighExposure / MediumPotential
+    // (SafeDenied и FalsePositive в список успешных не попадают)
+    // =========================================================================
+
+    // Проверка принадлежности вердикта к классу подтверждённых находок
+    private fun IdorVerdict.isVulnerable(): Boolean = when (this) {
+        IdorVerdict.CriticalModification,
+        IdorVerdict.HighExposure,
+        IdorVerdict.MediumPotential -> true
+        else -> false
+    }
+
+    /**
+     * Генерирует строго форматированный текст для поля details.
+     * Агрегация успешных векторов: вывод ограничивается тремя примерами для компактности отчёта;
+     * остальные помечаются строкой "... and N more vectors", полный список сохраняется в буфер находок
+     * и выгружается только при подробном экспорте.
+     */
+    fun generateStructuredDetails(
+        finding: VulnerabilityFinding,
+        analysisResults: List<Pair<String, IdorAnalysisResult>>,
+        totalTested: Int = analysisResults.size
+    ): String {
+        // Статистика берётся из best-вектора (максимальная критичность, при равенстве — максимальный diff)
+        val severityRank = mapOf("Critical" to 4, "High" to 3, "Medium" to 2, "Low" to 1, "Info" to 0)
+        val best = analysisResults.maxByOrNull { (severityRank[it.second.verdict.severity] ?: 0) * 1000 + it.second.similarityPercentage.toInt() }
+            ?.second
+
+        return buildString {
+            appendLine("=== IDOR FINDING ===")
+            appendLine(best?.verdict?.label ?: "Verdict: ${finding.type} (${finding.severity})")
+            appendLine("Severity: ${finding.severity}")
+            appendLine("URL: ${finding.url}")
+            appendLine()
+            appendLine("-- Successful Vectors Preview (${finding.successfulVectors.size}) --")
+            if (finding.successfulVectors.isEmpty()) {
+                appendLine("(none)")
+            } else {
+                // Не более 3-х примеров векторов, давших положительный вердикт
+                finding.successfulVectors.take(3).forEach { appendLine("* $it") }
+                // Скрытые записи: общее число попаданий минус отображённые примеры
+                val totalHits = analysisResults.size.coerceAtLeast(finding.successfulVectors.size)
+                if (totalHits > 3) {
+                    appendLine("... and ${totalHits - 3} more vectors")
+                }
+            }
+            appendLine()
+            appendLine("-- Statistics --")
+            appendLine("Total Tested: $totalTested")
+            appendLine("Successful Hits: ${analysisResults.size}")
+            appendLine("Max Response Diff: ${best?.let { "%.1f".format(it.similarityPercentage) + "%" } ?: "N/A"}")
+            appendLine("Victim ID Reflected: ${finding.victimIdReflected}")
+            appendLine("Sensitive Data Found: ${finding.sensitiveDataFound}")
+            appendLine()
+            appendLine("-- Analysis --")
+            // Текстовый блок анализатора содержит ту же метрику различия, что и поле responseDiff,
+            // поэтому дублирование строк Status/Method/Diff из detailsMessage исключено
+            val message = best?.detailsMessage.orEmpty()
+            appendLine(message.lines().dropWhile { line ->
+                line.startsWith("[") || line.startsWith("Status Code:") || line.startsWith("Method:") ||
+                        line.startsWith("Response Diff:") || line.startsWith("Victim ID Reflected:") ||
+                        line.startsWith("Sensitive Data Found:")
+            }.joinToString("\n").trim())
+        }.trimEnd()
+    }
+
+    /**
+     * Second-pass перегенерация компактного отчёта для уже сохранённой находки.
+     * Используется при экспорте: позволяет восстановить Statistics/Analysis по полному списку
+     * векторов без повторного сетевого анализа.
+     */
+    fun rebuildDetailsFromFinding(
+        finding: VulnerabilityFinding,
+        allSuccessfulVectors: List<String>,
+        verdictLabel: String? = null
+    ): String {
+        val displayVectors = allSuccessfulVectors.take(3)
+        val diffText = finding.responseDiff?.let { "%.1f".format(it) } ?: "N/A"
+        val identical = finding.responseDiff != null &&
+                finding.responseDiff <= 100.0 - IdorAnalysisResult.IDENTICAL_SIMILARITY_THRESHOLD_PERCENT
+
+        return buildString {
+            appendLine("=== IDOR FINDING ===")
+            appendLine(verdictLabel ?: finding.details.lineSequence().firstOrNull { it.startsWith("[") } ?: "Verdict: ${finding.type} (${finding.severity})")
+            appendLine("Severity: ${finding.severity}")
+            appendLine("URL: ${finding.url}")
+            appendLine()
+            appendLine("-- Successful Vectors Preview (${allSuccessfulVectors.size}) --")
+            if (displayVectors.isEmpty()) {
+                appendLine("(none)")
+            } else {
+                displayVectors.forEach { appendLine("* $it") }
+                if (allSuccessfulVectors.size > 3) {
+                    appendLine("... and ${allSuccessfulVectors.size - 3} more vectors")
+                }
+            }
+            appendLine()
+            appendLine("-- Statistics --")
+            appendLine("Total Tested: N/A")
+            appendLine("Successful Hits: ${allSuccessfulVectors.size}")
+            appendLine("Max Response Diff: $diffText${if (finding.responseDiff != null) "%" else ""}")
+            appendLine("Victim ID Reflected: ${finding.victimIdReflected}")
+            appendLine("Sensitive Data Found: ${finding.sensitiveDataFound}")
+            appendLine()
+            appendLine("-- Analysis --")
+            appendLine(
+                if (identical) {
+                    "Ответы семантически идентичны (Diff: $diffText%). Возможный False Positive или публичный ресурс."
+                } else if (finding.responseDiff != null) {
+                    "Ответ на мутированный запрос отличается от baseline на $diffText%. " +
+                            "Чужие данные прочитаны."
+                } else {
+                    "Метрика различия ответов недоступна."
+                }
+            )
+        }.trimEnd()
+    }
+
+    // =========================================================================
     // БЛОК АНАЛИЗА И ОРКЕСТРАЦИИ
     // =========================================================================
 
@@ -367,7 +753,8 @@ class MyExtension : BurpExtension {
             // Обновляем UI: начинаем сканирование
             dashboard.updateScanStatus(tracked.url, totalMutations, trackedRequests.size)
 
-            val vulnerableMutations = mutableListOf<String>()
+            val vulnerableMutations = mutableListOf<Pair<String, IdorAnalysisResult>>()
+            var testedCount = 0 // Счётчик реально отправленных мутаций для строки Statistics
 
             // 5. Проверяем все возможные мутации с обновлением прогресса
             for ((index, pair) in mutations.withIndex()) {
@@ -375,6 +762,7 @@ class MyExtension : BurpExtension {
 
                 // Обновляем прогресс-бар
                 dashboard.updateScanProgress(index + 1)
+                testedCount++
 
                 val mutatedResponse = sendRequest(api, mutatedRequest)
                 val checkResult = checkResponseForLeaks(mutatedResponse.bodyToString(), mutatedResponse.statusCode().toInt())
@@ -389,19 +777,44 @@ class MyExtension : BurpExtension {
                         type = "Info Disclosure",
                         severity = "Medium",
                         details = "Ответ содержит признаки утечки при мутации: $mutationType",
-                        request = mutatedRequest
+                        request = mutatedRequest,
+                        statusCode = mutatedResponse.statusCode().toInt()
                     ))
                 }
-                // СЦЕНАРИЙ Б: Ответ безопасен, проверяем на классический IDOR
-                else if (checkResult != ResponseCheckResult.ERROR_GENERIC) {
-                    // Очищаем ответы от динамических полей перед сравнением
-                    val cleanOriginalBody = stripDynamicFields(originalResponse.bodyToString())
-                    val cleanMutatedBody = stripDynamicFields(mutatedResponse.bodyToString())
+                // СЦЕНАРИЙ Б: Ответ безопасен, проверяем на IDOR через новый анализатор вердиктов
+                else {
+                    val extractedVictimId = ScannerConfig.victimIds.firstOrNull { mutationType.contains(it) } ?: ""
+                    val analysis = analyzeIdorResponse(
+                        originalMethod = tracked.method,
+                        victimId = extractedVictimId,
+                        baselineResponse = originalResponse,
+                        mutatedResponse = mutatedResponse,
+                        config = ScannerConfig
+                    )
 
-                    if (originalResponse.statusCode() == mutatedResponse.statusCode() &&
-                        cleanOriginalBody.length == cleanMutatedBody.length &&
-                        levenshteinDistance(cleanOriginalBody, cleanMutatedBody) < 50) {
-                        vulnerableMutations.add(mutationType)
+                    // Подробный аудит пишется для каждой мутации только при включённом режиме verboseExport;
+                    // в памяти удерживается сниппет тела ответа ограниченной длины
+                    if (ScannerConfig.verboseExport) {
+                        auditLog.add(
+                            AuditStep(
+                                url = tracked.url,
+                                method = tracked.method,
+                                vectorType = mutationType,
+                                mutatedRequestRaw = mutatedRequest.toString(),
+                                responseStatusCode = analysis.statusCode,
+                                responseBodySnippet = mutatedResponse.bodyToString().take(500),
+                                verdictLabel = analysis.verdict.label,
+                                responseDiffPercent = analysis.similarityPercentage,
+                                victimIdReflected = analysis.containsVictimId,
+                                sensitiveDataFound = analysis.containsSensitiveData
+                            )
+                        )
+                    }
+
+                    // В уязвимые идут только подтверждённые вердикты (Critical / High / Medium);
+                    // SafeDenied / FalsePositive отсекаются и не попадают в список успешных векторов
+                    if (analysis.verdict.isVulnerable()) {
+                        vulnerableMutations.add(mutationType to analysis)
                     }
                 }
             }
@@ -415,16 +828,45 @@ class MyExtension : BurpExtension {
                 if (isKnownPublic) {
                     api.logging().logToOutput("[*] Игнорировано: Публичный эндпоинт ${tracked.url} (False Positive)")
                 } else {
-                    api.logging().logToOutput("[!] НАЙДЕНА ПОТЕНЦИАЛЬНАЯ IDOR: ${tracked.url}")
-                    api.logging().logToOutput("[!] Подозрительные векторы: ${vulnerableMutations.joinToString(", ")}")
+                    // Агрегируем: берём вектор с максимальным уровнем критичности
+                    val severityRank = mapOf(
+                        "Critical" to 4, "High" to 3, "Medium" to 2, "Low" to 1, "Info" to 0
+                    )
+                    val (bestVector, bestAnalysis) = vulnerableMutations.maxByOrNull {
+                        severityRank[it.second.verdict.severity] ?: 0
+                    } ?: vulnerableMutations.first()
 
-                    dashboard.addFinding(VulnerabilityFinding(
+                    api.logging().logToOutput("[!] НАЙДЕНА ПОТЕНЦИАЛЬНАЯ IDOR [${bestAnalysis.verdict.severity}]: ${tracked.url}")
+                    // В лог консоли выводится не более 3-х векторов; полный список сохраняется в буфер находок
+                    api.logging().logToOutput(
+                        "[!] Подозрительные векторы (${vulnerableMutations.size}): " +
+                                vulnerableMutations.take(3).joinToString(", ") { it.first } +
+                                if (vulnerableMutations.size > 3) " ... and ${vulnerableMutations.size - 3} more" else ""
+                    )
+
+                    // Полный список успешных векторов сохраняем вне UI-модели для подробного экспорта
+                    allVectorsByFinding[tracked.url] = vulnerableMutations.map { it.first }
+
+                    // Находка: severity из вердикта best-вектора, details — компактный структурированный отчёт
+                    val finding = VulnerabilityFinding(
                         url = tracked.url,
                         type = "IDOR",
-                        severity = "High",
-                        details = "Векторы: ${vulnerableMutations.joinToString(", ")}",
-                        request = cleanOriginalRequest
-                    ))
+                        severity = bestAnalysis.verdict.severity,   // из вердикта, а не хардкод "High"
+                        details = "",                                // заполняется ниже через generateStructuredDetails
+                        request = cleanOriginalRequest,
+                        // В модель попадает максимум 3 вектора — остальные доступны только через audit-экспорт
+                        successfulVectors = vulnerableMutations.map { it.first }.take(3),
+                        statusCode = bestAnalysis.statusCode,
+                        responseDiff = bestAnalysis.similarityPercentage,
+                        victimIdReflected = bestAnalysis.containsVictimId,
+                        sensitiveDataFound = bestAnalysis.containsSensitiveData
+                    )
+
+                    dashboard.addFinding(
+                        finding.copy(
+                            details = generateStructuredDetails(finding, vulnerableMutations, totalTested = testedCount)
+                        )
+                    )
                 }
             }
 
@@ -444,13 +886,15 @@ class MyExtension : BurpExtension {
     }
 
     private fun runNucleiScan(api: MontoyaApi, request: HttpRequest) {
+        // Путь к бинарному файлу берётся из конфигурации; пустое значение — фоллбэк на поиск по PATH
+        val nucleiPath = ScannerConfig.nucleiExecutablePath.ifBlank { "nuclei" }
+        var tempFile: File? = null
         try {
             // Создание временного файла с Raw HTTP запросом
-            val tempFile = File.createTempFile("autoscan_req_", ".txt").apply { writeText(request.toString()) }
+            tempFile = File.createTempFile("autoscan_req_", ".txt").apply { writeText(request.toString()) }
 
-            // Настройка процесса: путь к binary (измените при необходимости), вывод в JSON, таймаут
-            // Примечание: если nuclei не в PATH, укажите полный путь, например: "/home/kali/go/bin/nuclei"
-            val processBuilder = ProcessBuilder(listOf("nuclei", "-l", tempFile.absolutePath, "-json", "-timeout", "30")).apply {
+            // Настройка процесса: вывод в NDJSON, таймаут на один запрос
+            val processBuilder = ProcessBuilder(listOf(nucleiPath, "-l", tempFile.absolutePath, "-json", "-timeout", "30")).apply {
                 redirectErrorStream(true)
             }
             api.logging().logToOutput("[NUCLEI] Запуск сканирования: ${request.url()}")
@@ -477,17 +921,29 @@ class MyExtension : BurpExtension {
                             type = "Nuclei",
                             severity = severity,
                             details = info?.get("name")?.asText() ?: "Unknown",
-                            request = request
+                            request = request,
+                            statusCode = jsonNode["status-code"]?.asInt() ?: 0
                         ))
                     }
                 } catch (_: Exception) { } // Игнорируем служебные строки, не являющиеся JSON
             }
 
             process.waitFor()
-            tempFile.delete() // Очистка временных файлов
             api.logging().logToOutput("[NUCLEI] Сканирование завершено для: ${request.url()} (Найдено: $findingsCount)")
+        } catch (e: IOException) {
+            // Выводим ошибку отсутствия Nuclei только один раз за сессию, чтобы избежать спама в консоли Burp
+            if (!nucleiUnavailableLogged) {
+                nucleiUnavailableLogged = true
+                api.logging().logToOutput(
+                    "[NUCLEI] Ошибка запуска Nuclei. Проверьте путь в настройках: $nucleiPath. " +
+                            "Укажите абсолютный путь к бинарнику (например, /home/kali/go/bin/nuclei или C:\\nuclei\\nuclei.exe) " +
+                            "в Settings -> External Tools."
+                )
+            }
         } catch (e: Exception) {
             api.logging().logToOutput("[!] Ошибка Nuclei: ${e.message}")
+        } finally {
+            tempFile?.delete() // Очистка временных файлов выполняется при любом исходе
         }
     }
 }

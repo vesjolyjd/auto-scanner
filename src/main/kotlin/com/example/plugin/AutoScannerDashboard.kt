@@ -26,7 +26,7 @@ class FindingsTableModel(val findings: MutableList<VulnerabilityFinding>) : Abst
     override fun getColumnCount(): Int = columns.size
     override fun getColumnName(column: Int): String = columns[column]
     override fun getColumnClass(columnIndex: Int): Class<*> = when (columnIndex) {
-        0 -> java.lang.Integer::class.java
+        0 -> Int::class.javaObjectType // Integer.class для корректной числовой сортировки в JTable
         else -> String::class.java
     }
 
@@ -89,8 +89,10 @@ class SeverityCellRenderer(private val table: JTable) : javax.swing.table.Defaul
                 else -> Color.BLACK
             }
         }
-        (component as JLabel).horizontalAlignment = SwingConstants.CENTER
-        (component as JLabel).font = Font("SansSerif", Font.BOLD, 11)
+        (component as JLabel).apply {
+            horizontalAlignment = SwingConstants.CENTER
+            font = Font("SansSerif", Font.BOLD, 11)
+        }
         return component
     }
 }
@@ -158,14 +160,15 @@ class DetailsCellRenderer(private val table: JTable) : javax.swing.table.TableCe
 
         textArea.foreground = if (!isSelected) Color.BLACK else table?.selectionForeground ?: Color.BLACK
 
-        // 2. Форматируем текст БЕЗ добавления маркеров (они уже есть в тексте)
+        // 2. Форматируем текст: максимум 2 строки, чтобы не завышать высоту строк таблицы
         val rawText = value?.toString() ?: ""
         val lines = rawText.split("\n").filter { it.isNotBlank() }
 
-        // Если строк больше 3, сокращаем
-        val displayText = if (lines.size > 3) {
-            val preview = lines.take(3).joinToString("\n")
-            "$preview\n… и ещё ${lines.size - 3}"
+        val maxVisibleLines = 2
+        // Если строк больше 2, сокращаем и добавляем счётчик скрытых строк
+        val displayText = if (lines.size > maxVisibleLines) {
+            val preview = lines.take(maxVisibleLines).joinToString("\n")
+            "$preview\n... и ещё ${lines.size - maxVisibleLines} строк"
         } else {
             lines.joinToString("\n")
         }
@@ -188,26 +191,29 @@ class AutoScannerDashboardPanel(private val api: MontoyaApi) : JPanel() {
     private val findingsList = java.util.concurrent.CopyOnWriteArrayList<VulnerabilityFinding>()
     private val tableModel = FindingsTableModel(findingsList)
 
-    // Поля для панели статуса (должны быть доступны всем методам класса)
-    private lateinit var statusLabel: JLabel
-    private lateinit var progressBar: JProgressBar
-    private lateinit var queueLabel: JLabel
+    // Поля для панели статуса (инициализируются в init-блоке до первого использования)
+    private val statusLabel: JLabel
+    private val progressBar: JProgressBar
+    private val queueLabel: JLabel
 
     // Счетчики для агрегированного прогресса
     private var totalMutationsAll = 0
     private var completedMutationsAll = 0
     private var activeUrls = 0
 
+    // Сортировщик таблицы: создаётся явно, чтобы избежать unchecked-каста table.rowSorter
+    private val sorter = TableRowSorter(tableModel)
+
     // Инициализация и настройка внешнего вида JTable
     private val table = JTable(tableModel).apply {
         autoResizeMode = JTable.AUTO_RESIZE_LAST_COLUMN
-        rowHeight = 70
+        rowHeight = 48 // Компактные строки: рендерер обрезает details до 2 видимых строк
         rowSelectionAllowed = true
         setSelectionMode(ListSelectionModel.SINGLE_SELECTION)
         tableHeader.reorderingAllowed = false
         gridColor = Color(220, 220, 220)
         setShowGrid(true)
-        rowSorter = TableRowSorter(tableModel) // Сортировка по клику на заголовок
+        rowSorter = sorter // Сортировка по клику на заголовок; тот же экземпляр используется фильтрами
 
         // Применяем рендереры ко всем колонкам
         for (i in 0 until columnCount) {
@@ -230,8 +236,6 @@ class AutoScannerDashboardPanel(private val api: MontoyaApi) : JPanel() {
         getColumnModel().getColumn(4).preferredWidth = 500
         getColumnModel().getColumn(5).apply { preferredWidth = 80; maxWidth = 100 }
     }
-
-    private val sorter = table.rowSorter as TableRowSorter<FindingsTableModel>
 
     // Элементы управления (фильтры и поиск)
     private val searchField = JTextField()
@@ -463,19 +467,30 @@ class AutoScannerDashboardPanel(private val api: MontoyaApi) : JPanel() {
             completedMutationsAll = minOf(completedMutationsAll, totalMutationsAll)
 
             if (activeUrls == 0) {
-                // Все завершены
-                statusLabel.text = "✅ Готово"
+                // Все известные мутации выполнены: фиксируем прогресс, но итоговый текст статуса
+                // выставляет монитор завершения (finalizeScanStatus) после достижения нуля активными сессиями.
+                // Это исключает преждевременное "Готово" при наложении параллельных скан-сессий.
                 progressBar.isIndeterminate = false
                 progressBar.value = progressBar.maximum
                 progressBar.string = "Завершено"
-
-                // Сброс счетчиков только после полной остановки
-                totalMutationsAll = 0
-                completedMutationsAll = 0
             } else {
                 // Ещё есть активные, обновляем строку
                 progressBar.string = "$completedMutationsAll / $totalMutationsAll"
             }
+        }
+    }
+
+    /**
+     * Финализация текстовой метки статуса по завершении всех фоновых потоков сканирования.
+     * Вызывается из монитора-наблюдателя; обновление JLabel выполняется строго в UI-потоке.
+     */
+    fun finalizeScanStatus(processedCount: Int) {
+        SwingUtilities.invokeLater {
+            statusLabel.text = "Завершено: обработано $processedCount URL"
+            // Сброс счетчиков только после полной остановки всех сессий
+            totalMutationsAll = 0
+            completedMutationsAll = 0
+            activeUrls = 0
         }
     }
 
@@ -561,7 +576,8 @@ class AutoScannerDashboardPanel(private val api: MontoyaApi) : JPanel() {
         }
     }
 
-    // Экспорт всех находок в форматированный JSON-файл
+    // Экспорт всех находок в форматированный JSON-файл.
+    // При включённом режиме подробного аудита формируется второй файл с полным логом шагов анализа.
     private fun exportToJson() {
         if (findingsList.isEmpty()) {
             JOptionPane.showMessageDialog(this, "Нет данных.", "Информация", JOptionPane.INFORMATION_MESSAGE)
@@ -570,11 +586,38 @@ class AutoScannerDashboardPanel(private val api: MontoyaApi) : JPanel() {
         val chooser = JFileChooser().apply { dialogTitle = "Экспорт"; selectedFile = File("autoscan_findings_${System.currentTimeMillis()}.json") }
         if (chooser.showSaveDialog(this) == JFileChooser.APPROVE_OPTION) {
             try {
-                val json = ObjectMapper().writerWithDefaultPrettyPrinter().writeValueAsString(findingsList.map {
-                    mapOf("url" to it.url, "type" to it.type, "severity" to it.severity, "details" to it.details, "timestamp" to it.timestamp)
+                val mapper = ObjectMapper()
+                val json = mapper.writerWithDefaultPrettyPrinter().writeValueAsString(findingsList.map {
+                    mapOf(
+                        "url" to it.url,
+                        "type" to it.type,
+                        "severity" to it.severity,
+                        "statusCode" to it.statusCode,
+                        "responseDiff" to it.responseDiff,
+                        "victimIdReflected" to it.victimIdReflected,
+                        "sensitiveDataFound" to it.sensitiveDataFound,
+                        "successfulVectors" to it.successfulVectors,
+                        "details" to it.details,
+                        "timestamp" to it.timestamp
+                    )
                 })
                 FileWriter(chooser.selectedFile).use { it.write(json) }
-                JOptionPane.showMessageDialog(this, "Экспорт завершён!", "Успех", JOptionPane.INFORMATION_MESSAGE)
+
+                // Подробный аудит: отдельный файл со всеми записанными шагами анализа текущей сессии
+                if (ScannerConfig.verboseExport) {
+                    val auditFile = File(chooser.selectedFile.parentFile, "full_audit_log.json")
+                    val auditJson = mapper.writerWithDefaultPrettyPrinter()
+                        .writeValueAsString(MyExtension.currentInstance?.auditSnapshot().orEmpty())
+                    FileWriter(auditFile).use { it.write(auditJson) }
+                    JOptionPane.showMessageDialog(
+                        this,
+                        "Экспорт завершён!\nНаходки: ${chooser.selectedFile.name}\nПолный аудит: ${auditFile.name}",
+                        "Успех",
+                        JOptionPane.INFORMATION_MESSAGE
+                    )
+                } else {
+                    JOptionPane.showMessageDialog(this, "Экспорт завершён!", "Успех", JOptionPane.INFORMATION_MESSAGE)
+                }
             } catch (e: Exception) {
                 JOptionPane.showMessageDialog(this, "Ошибка: ${e.message}", "Ошибка", JOptionPane.ERROR_MESSAGE)
             }
